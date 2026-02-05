@@ -3,8 +3,9 @@
 # Bootable container image for Olares OS
 # Based on bootc (https://containers.github.io/bootc/)
 #
-# This creates an immutable OS image with k3s pre-installed.
-# The system boots directly into this image and auto-starts k3s.
+# This creates an immutable OS image that runs k3s as a container (via Quadlet).
+# Zero bootstrap binaries needed - k3s runs in a container, CNI plugins
+# are installed by Calico DaemonSet. The system boots and auto-starts k3s.
 #
 # Build:
 #   podman build --platform linux/amd64 \
@@ -62,37 +63,75 @@ RUN dnf install -y \
     && rm -rf /var/cache/dnf
 
 # =============================================================================
-# Bootstrap Binaries Installation
+# Quadlet: k3s runs as a container
 #
-# Only 2 binaries are needed for the container-native OS:
-# 1. k3s - includes containerd, kubelet, kubectl, crictl, ctr
-# 2. CNI plugins - for Calico networking (k3s has flannel, but Olares uses Calico)
+# k3s runs as a systemd-managed container via Podman Quadlet:
+# - Atomic updates via container image tags
+# - OCI image signatures for verification
+# - Consistent across architectures
+#
+# CNI plugins are baked into this image (required for Calico networking).
+# Calico is deployed separately and uses these base CNI plugins.
 # =============================================================================
 
-ARG K3S_VERSION=v1.33.3+k3s1
-ARG CNI_VERSION=v1.6.2
-ARG TARGETARCH=amd64
+# Install Quadlet unit files for k3s
+# These define how systemd manages the k3s container
+COPY quadlet/k3s.container /usr/share/containers/systemd/k3s.container
+COPY quadlet/k3s-data.volume /usr/share/containers/systemd/k3s-data.volume
 
-# Download k3s binary
-# k3s is a single binary that includes: containerd, kubelet, kubectl, crictl, ctr
-RUN curl -fsSL "https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/k3s$([ \"${TARGETARCH}\" = \"arm64\" ] && echo \"-arm64\" || echo \"\")" \
-    -o /usr/local/bin/k3s \
-    && chmod +x /usr/local/bin/k3s
+# Create directories that k3s/Calico will need
+RUN mkdir -p /etc/rancher/k3s \
+    && mkdir -p /opt/cni/bin \
+    && mkdir -p /etc/cni/net.d \
+    && mkdir -p /var/lib/kubelet \
+    && mkdir -p /var/log/pods
 
-# Create symlinks for kubectl, crictl, ctr (provided by k3s)
-RUN ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl \
-    && ln -sf /usr/local/bin/k3s /usr/local/bin/crictl \
-    && ln -sf /usr/local/bin/k3s /usr/local/bin/ctr
+# =============================================================================
+# CNI Directories
+#
+# Calico runs as Kubernetes pods (DaemonSet). Its install-cni init container
+# copies calico and calico-ipam binaries from calico/cni image to /opt/cni/bin.
+# No CNI plugins need to be pre-installed - truly container-native!
+# =============================================================================
+# Directories already created above: /opt/cni/bin, /etc/cni/net.d
 
-# Download CNI plugins (required for Calico)
-RUN mkdir -p /opt/cni/bin \
-    && curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-${TARGETARCH}-${CNI_VERSION}.tgz" \
-    | tar -xz -C /opt/cni/bin
+# =============================================================================
+# CLI Wrapper Scripts
+# These provide kubectl/helm commands on the host that delegate to containers
+# =============================================================================
 
-# k3s configuration directory
-RUN mkdir -p /etc/rancher/k3s
+# kubectl wrapper - runs kubectl inside the k3s container
+COPY <<'EOF' /usr/local/bin/kubectl
+#!/bin/bash
+exec podman exec -i k3s kubectl "$@"
+EOF
+RUN chmod +x /usr/local/bin/kubectl
 
-# k3s server configuration
+# helm wrapper - runs helm in a container with kubeconfig
+COPY <<'EOF' /usr/local/bin/helm
+#!/bin/bash
+exec podman run --rm -i \
+    -v /etc/rancher/k3s/k3s.yaml:/root/.kube/config:ro \
+    --network=host \
+    docker.io/alpine/helm:3.17.1 "$@"
+EOF
+RUN chmod +x /usr/local/bin/helm
+
+# crictl wrapper - runs crictl inside the k3s container
+COPY <<'EOF' /usr/local/bin/crictl
+#!/bin/bash
+exec podman exec -i k3s crictl "$@"
+EOF
+RUN chmod +x /usr/local/bin/crictl
+
+# ctr wrapper - runs ctr inside the k3s container (containerd CLI)
+COPY <<'EOF' /usr/local/bin/ctr
+#!/bin/bash
+exec podman exec -i k3s ctr "$@"
+EOF
+RUN chmod +x /usr/local/bin/ctr
+
+# k3s configuration (read by k3s container via volume mount)
 COPY <<'EOF' /etc/rancher/k3s/config.yaml
 # k3s server configuration for Olares
 write-kubeconfig-mode: "0644"
@@ -101,46 +140,17 @@ write-kubeconfig-mode: "0644"
 disable:
   - traefik       # Olares uses its own ingress
   - servicelb     # Olares uses its own load balancer
-  - flannel       # Olares uses Calico for network policies
 
-# Use Calico CNI instead of flannel
+# Disable k3s built-in flannel (Olares uses Calico)
 flannel-backend: none
-cni: calico
 
+# Additional API server SANs
 tls-san:
   - "olares.local"
   - "localhost"
 
 kubelet-arg:
   - "max-pods=250"
-EOF
-
-# k3s systemd service
-COPY <<'EOF' /usr/lib/systemd/system/k3s.service
-[Unit]
-Description=Lightweight Kubernetes
-Documentation=https://k3s.io
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=notify
-EnvironmentFile=-/etc/default/k3s
-EnvironmentFile=-/etc/sysconfig/k3s
-ExecStartPre=/bin/sh -c '! /usr/bin/systemctl is-enabled --quiet nm-wait-online.service 2>/dev/null || /usr/bin/systemctl start nm-wait-online.service'
-ExecStart=/usr/local/bin/k3s server
-KillMode=process
-Delegate=yes
-LimitNOFILE=1048576
-LimitNPROC=infinity
-LimitCORE=infinity
-TasksMax=infinity
-TimeoutStartSec=0
-Restart=always
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
 EOF
 
 # =============================================================================
@@ -152,24 +162,51 @@ COPY <<'AGENT_EOF' /usr/local/bin/olares-agent
 #!/bin/bash
 # Olares Bootstrap Agent
 # This script runs after k3s starts and bootstraps the Olares system
+#
+# Note: kubectl runs inside the k3s container, accessed via podman exec
 
 set -euo pipefail
 
 OLARES_STATE_DIR="/var/lib/olares"
 OLARES_CONFIG="/etc/olares/config.yaml"
-KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
 
 log() {
     echo "[olares-agent] $(date -Iseconds) $*"
 }
 
+# kubectl wrapper - runs kubectl inside the k3s container
+kubectl() {
+    podman exec k3s kubectl "$@"
+}
+
+# helm wrapper - runs helm inside a container with kubeconfig access
+helm() {
+    podman run --rm \
+        -v /etc/rancher/k3s/k3s.yaml:/root/.kube/config:ro \
+        -v /var/lib/olares:/var/lib/olares \
+        --network=host \
+        docker.io/alpine/helm:3.17.1 "$@"
+}
+
 wait_for_k3s() {
-    log "Waiting for k3s to be ready..."
+    log "Waiting for k3s container to be ready..."
     local retries=120
     local count=0
     
+    # First wait for the k3s container to be running
+    while [[ $count -lt 30 ]]; do
+        if podman container exists k3s && \
+           [[ "$(podman inspect -f '{{.State.Running}}' k3s 2>/dev/null)" == "true" ]]; then
+            break
+        fi
+        count=$((count + 1))
+        sleep 2
+    done
+    
+    # Then wait for the Kubernetes API to be ready
+    count=0
     while [[ $count -lt $retries ]]; do
-        if kubectl --kubeconfig="$KUBECONFIG" get nodes &>/dev/null; then
+        if kubectl get nodes &>/dev/null; then
             log "k3s is ready"
             return 0
         fi
@@ -191,8 +228,8 @@ bootstrap() {
     mkdir -p "$OLARES_STATE_DIR"
     
     # Create olares-system namespace
-    kubectl --kubeconfig="$KUBECONFIG" create namespace olares-system --dry-run=client -o yaml | \
-        kubectl --kubeconfig="$KUBECONFIG" apply -f -
+    kubectl create namespace olares-system --dry-run=client -o yaml | \
+        kubectl apply -f -
     
     # Apply system configuration
     # TODO: Install Helm charts from OCI registry
@@ -279,8 +316,9 @@ EOF
 # Enable Services
 # =============================================================================
 
-RUN systemctl enable k3s.service \
-    && systemctl enable olares-agent.service
+# Note: k3s.service is auto-generated by Quadlet from k3s.container
+# We just need to enable olares-agent which depends on it
+RUN systemctl enable olares-agent.service
 
 # =============================================================================
 # Persistent Data Directories

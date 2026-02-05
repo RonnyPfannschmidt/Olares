@@ -69,9 +69,24 @@ tmpfs: /run, /var/run      # Runtime directories
 ulimits: nproc=65535       # Process limits
          nofile=65535      # File descriptor limits
 volume: /var/lib/rancher/k3s  # Persistent data
+volume: /opt/cni/bin       # CNI plugins (written by Calico)
+volume: /etc/cni/net.d     # CNI configuration
 ```
 
 These are all configured in `k3s.container`.
+
+## CNI Plugins (Installed by Calico)
+
+**No CNI plugins need to be pre-installed** - fully container-native:
+
+1. k3s starts with `--flannel-backend=none` (k3s's flannel is disabled)
+2. k3s waits for CNI to be available (node shows `NotReady`)
+3. When Calico DaemonSet is deployed, its `install-cni` init container runs
+4. The init container copies `calico` and `calico-ipam` from `calico/cni` image to `/opt/cni/bin`
+5. Calico writes CNI config to `/etc/cni/net.d/`
+6. k3s detects CNI plugins and node becomes `Ready`
+
+The k3s.container mounts `/opt/cni/bin` and `/etc/cni/net.d` from the host so Calico can write to them.
 
 ## Comparison: Binary vs Container
 

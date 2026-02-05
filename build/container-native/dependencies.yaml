@@ -1,11 +1,22 @@
 # Olares Container-Native Dependencies
 # 
-# This manifest defines dependencies for the container-native Olares OS:
-# - bootstrap: Only 2 binaries needed (k3s + cni-plugins)
-# - images: Everything else runs as containers
-# - system: Kernel modules and system packages (optional)
+# This manifest defines dependencies for the container-native Olares OS.
 #
-# k3s includes containerd, kubelet, kubectl, crictl, ctr in a single binary.
+# =============================================================================
+# DEPLOYMENT APPROACHES:
+#
+# 1. QUADLET (Fully Container-Native)
+#    - k3s runs as a systemd-managed container via Podman Quadlet
+#    - Calico CNI plugins installed by DaemonSet (from calico/cni image)
+#    - kubectl/helm/etc are wrapper scripts that exec into containers
+#    - Zero host binaries needed!
+#    - See: quadlet/k3s.container, quadlet/README.md
+#
+# 2. BINARY FALLBACK (Legacy compatibility)
+#    - k3s binary downloaded to /usr/local/bin
+#    - CNI plugins downloaded to /opt/cni/bin
+#
+# =============================================================================
 
 apiVersion: olares.com/v1alpha1
 kind: DependencyManifest
@@ -15,36 +26,45 @@ metadata:
 
 spec:
   # ==========================================================================
-  # BOOTSTRAP BINARIES (k3s mode - MINIMAL)
+  # QUADLET CONTAINER IMAGES (Fully Container-Native)
   # 
-  # k3s includes: containerd, kubelet, kubectl, crictl, ctr
-  # We only need k3s + cni-plugins (for Calico, since k3s uses flannel by default)
-  # Helm can run as a container!
+  # In Quadlet mode, k3s is managed by systemd via Podman Quadlet.
+  # Calico CNI plugins are installed by DaemonSet - no host binaries needed!
   # ==========================================================================
-  bootstrap:
-    # k3s: Single binary that includes everything
-    # - containerd (container runtime)
-    # - kubelet (node agent)  
-    # - kubectl (CLI, via symlink)
-    # - crictl, ctr (container tools)
+  quadlet:
+    # k3s container - replaces k3s binary
+    # Includes: containerd, kubelet, kubectl, crictl, ctr
     - id: k3s
-      version: "1.33.3+k3s1"
+      image: docker.io/rancher/k3s:v1.32.3-k3s1
+      description: "Lightweight Kubernetes (container mode)"
+      quadletFile: k3s.container
+
+  # ==========================================================================
+  # BOOTSTRAP BINARIES (Legacy fallback mode)
+  # 
+  # Only used when Quadlet/container mode is not available.
+  # k3s includes: containerd, kubelet, kubectl, crictl, ctr
+  # ==========================================================================
+  bootstrap_legacy:
+    # k3s: Single binary that includes everything
+    - id: k3s
+      version: "1.32.3+k3s1"
       description: "Lightweight Kubernetes (includes containerd, kubelet, kubectl)"
       installPath: /usr/local/bin
       artifacts:
         linux/amd64:
-          url: https://github.com/k3s-io/k3s/releases/download/v1.33.3+k3s1/k3s
+          url: https://github.com/k3s-io/k3s/releases/download/v1.32.3+k3s1/k3s
           sha256: ""  # TODO: Add checksum
         linux/arm64:
-          url: https://github.com/k3s-io/k3s/releases/download/v1.33.3+k3s1/k3s-arm64
+          url: https://github.com/k3s-io/k3s/releases/download/v1.32.3+k3s1/k3s-arm64
           sha256: ""
       symlinks:
         - kubectl
         - crictl
         - ctr
 
-    # CNI plugins for Calico networking
-    # (k3s includes flannel, but Olares uses Calico for network policies)
+    # CNI plugins (only for legacy binary mode)
+    # In Quadlet mode, Calico DaemonSet installs CNI plugins from container images
     - id: cni-plugins
       version: "1.6.2"
       description: "Container Network Interface plugins (for Calico)"
@@ -91,6 +111,23 @@ spec:
 
     - image: registry.k8s.io/coredns/coredns:v1.12.0
       description: "Cluster DNS"
+      required: true
+
+    # -------------------------------------------------------------------------
+    # Networking (Calico)
+    # Olares uses Calico for network policies (k3s flannel is disabled)
+    # Calico DaemonSet installs CNI plugins from container images - fully container-native!
+    # -------------------------------------------------------------------------
+    - image: docker.io/calico/cni:v3.29.2
+      description: "Calico CNI plugin (install-cni init container copies to /opt/cni/bin)"
+      required: true
+
+    - image: docker.io/calico/node:v3.29.2
+      description: "Calico node agent"
+      required: true
+
+    - image: docker.io/calico/kube-controllers:v3.29.2
+      description: "Calico Kubernetes controllers"
       required: true
 
     # -------------------------------------------------------------------------

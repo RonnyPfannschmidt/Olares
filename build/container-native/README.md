@@ -13,8 +13,8 @@ This directory contains the new container-native build system for Olares, design
 
 **After (Container-Native):**
 - **Zero bootstrap binaries** with Quadlet approach (k3s runs as container!)
-- Or just 2 binaries with binary approach: `k3s` + `cni-plugins`
-- Everything else runs as containers
+- Calico CNI plugins installed by DaemonSet (from container images)
+- Everything runs as containers
 - Standard OCI registries for distribution
 - Atomic upgrades via bootc
 - k3s mode exclusively (simpler, k3s includes containerd+kubelet+kubectl)
@@ -72,13 +72,21 @@ See `quadlet/README.md` for details.
 
 ## Dependency Categories
 
-### Bootstrap Binaries (Must be on host)
-Only 2 binaries needed for container-native k3s mode:
-- `k3s` - Lightweight Kubernetes (includes containerd, kubelet, kubectl)
-- `cni-plugins` - For Calico networking (k3s has flannel built-in, but Olares uses Calico)
+### Quadlet Mode (Fully Container-Native)
+- `k3s` runs as a container via Podman Quadlet
+- Calico CNI plugins installed by DaemonSet (from `calico/cni` image)
+- CLI tools (`kubectl`, `helm`) are wrapper scripts that exec into containers
+- **Zero host binaries** - everything comes from container images
 
-### Container Images (Everything else)
-All other tools run as containers:
+### Legacy Binary Mode (Fallback)
+For systems without Podman/Quadlet:
+- `k3s` binary downloaded to `/usr/local/bin`
+- `cni-plugins` downloaded to `/opt/cni/bin`
+
+### Container Images
+All components run as containers:
+- `rancher/k3s` - k3s itself (in Quadlet mode)
+- `calico/*` - Calico networking (CNI plugins installed via DaemonSet)
 - `kubectl`, `helm`, `etcdctl` - CLI tools
 - `minio`, `redis`, `postgres` - Databases/storage
 - `velero`, `restic` - Backup tools
