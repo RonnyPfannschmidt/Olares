@@ -146,6 +146,191 @@ def check_image_exists(image: str) -> bool:
     return result.returncode == 0
 
 
+@dataclass
+class WorkflowRun:
+    """Information about a GitHub Actions workflow run."""
+
+    id: int
+    status: str  # queued, in_progress, completed
+    conclusion: str | None  # success, failure, cancelled, etc.
+    name: str
+    html_url: str
+    created_at: str
+    jobs: list[dict]
+
+
+def get_pr_workflow_runs(owner: str, repo: str, pr_number: int) -> list[WorkflowRun]:
+    """Get workflow runs for a PR."""
+    # Get the head SHA for this PR
+    result = subprocess.run(
+        [
+            "gh", "pr", "view", str(pr_number),
+            "--repo", f"{owner}/{repo}",
+            "--json", "headRefOid",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return []
+
+    try:
+        pr_data = json.loads(result.stdout)
+        head_sha = pr_data.get("headRefOid", "")
+    except json.JSONDecodeError:
+        return []
+
+    # Get workflow runs for this commit
+    result = subprocess.run(
+        [
+            "gh", "run", "list",
+            "--repo", f"{owner}/{repo}",
+            "--commit", head_sha,
+            "--json", "databaseId,status,conclusion,name,url,createdAt",
+            "--limit", "10",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return []
+
+    try:
+        runs_data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    runs = []
+    for run in runs_data:
+        # Get jobs for this run
+        jobs_result = subprocess.run(
+            [
+                "gh", "run", "view", str(run["databaseId"]),
+                "--repo", f"{owner}/{repo}",
+                "--json", "jobs",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        jobs = []
+        if jobs_result.returncode == 0:
+            try:
+                jobs_data = json.loads(jobs_result.stdout)
+                jobs = jobs_data.get("jobs", [])
+            except json.JSONDecodeError:
+                pass
+
+        runs.append(WorkflowRun(
+            id=run["databaseId"],
+            status=run.get("status", "unknown"),
+            conclusion=run.get("conclusion"),
+            name=run.get("name", "unknown"),
+            html_url=run.get("url", ""),
+            created_at=run.get("createdAt", ""),
+            jobs=jobs,
+        ))
+
+    return runs
+
+
+def show_workflow_status(owner: str, repo: str, pr_number: int) -> tuple[bool, str | None]:
+    """Show the status of PR workflow runs. Returns (ready, status)."""
+    print("\nChecking GitHub Actions status...")
+    
+    runs = get_pr_workflow_runs(owner, repo, pr_number)
+    
+    # Filter to PR Build Images workflow
+    image_runs = [r for r in runs if "PR Build" in r.name or "build" in r.name.lower()]
+    
+    if not image_runs:
+        print("  No image build workflows found for this PR")
+        print("  The workflow may not have triggered yet.")
+        return False, "no_workflow"
+    
+    latest_run = image_runs[0]
+    
+    # Status symbols
+    status_symbols = {
+        "completed": "✅" if latest_run.conclusion == "success" else "❌",
+        "in_progress": "🔄",
+        "queued": "⏳",
+    }
+    symbol = status_symbols.get(latest_run.status, "❓")
+    
+    print(f"\n  {symbol} {latest_run.name}")
+    print(f"     Status: {latest_run.status}", end="")
+    if latest_run.conclusion:
+        print(f" ({latest_run.conclusion})")
+    else:
+        print()
+    print(f"     URL: {latest_run.html_url}")
+    
+    # Show job details if in progress
+    if latest_run.status == "in_progress" and latest_run.jobs:
+        print("\n  Jobs:")
+        for job in latest_run.jobs:
+            job_status = job.get("status", "unknown")
+            job_conclusion = job.get("conclusion")
+            job_name = job.get("name", "unknown")
+            
+            if job_status == "completed":
+                job_symbol = "✅" if job_conclusion == "success" else "❌"
+            elif job_status == "in_progress":
+                job_symbol = "🔄"
+            elif job_status == "queued":
+                job_symbol = "⏳"
+            else:
+                job_symbol = "  "
+            
+            print(f"    {job_symbol} {job_name}")
+    
+    # Check if images should be ready
+    if latest_run.status == "completed" and latest_run.conclusion == "success":
+        print("\n  ✅ Images should be ready!")
+        return True, "success"
+    elif latest_run.status == "completed":
+        print(f"\n  ❌ Build failed: {latest_run.conclusion}")
+        return False, "failed"
+    else:
+        print("\n  ⏳ Build in progress...")
+        return False, "in_progress"
+
+
+def wait_for_workflow(owner: str, repo: str, pr_number: int) -> bool:
+    """Wait for workflow to complete. Returns True if successful."""
+    import time
+    
+    print("\nWaiting for workflow to complete...")
+    print("Press Ctrl+C to stop waiting\n")
+    
+    poll_interval = 30  # seconds
+    max_wait = 3600  # 1 hour
+    elapsed = 0
+    
+    try:
+        while elapsed < max_wait:
+            ready, status = show_workflow_status(owner, repo, pr_number)
+            
+            if ready:
+                return True
+            elif status == "failed":
+                return False
+            elif status == "no_workflow":
+                print(f"\nWaiting for workflow to start... (retry in {poll_interval}s)")
+            else:
+                print(f"\nWaiting... (retry in {poll_interval}s)")
+            
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+            print("\n" + "=" * 50)
+        
+        print(f"\nTimeout after {max_wait}s")
+        return False
+    except KeyboardInterrupt:
+        print("\n\nStopped waiting.")
+        return False
+
+
 def build_podman_command(
     pr_info: PRInfo,
     *,
@@ -167,6 +352,7 @@ def build_podman_command(
         "--rm",
         "-it",
         "--privileged",
+        "--pull=always",  # Always pull latest image
         "--device",
         "/dev/kvm",
         "-v",
@@ -265,6 +451,17 @@ def main() -> int:
         default=None,
         help="VM hostname (default: olares-pr-<N>)",
     )
+    parser.add_argument(
+        "--wait",
+        "-w",
+        action="store_true",
+        help="Wait for workflow to complete before starting VM",
+    )
+    parser.add_argument(
+        "--status-only",
+        action="store_true",
+        help="Only show workflow status, don't start VM",
+    )
     args = parser.parse_args()
 
     # Get current branch
@@ -327,16 +524,37 @@ def main() -> int:
         hostname=args.hostname,
     )
 
-    # Check if image exists
+    # Check workflow status and if image exists
     image = f"{pr_info.registry}/olares-test-vm:{pr_info.tag}"
+    
+    images_ready, status = show_workflow_status(owner, repo, pr_info.number)
+    
+    # If --status-only, just show status and exit
+    if args.status_only:
+        return 0 if images_ready else 1
+    
+    # If --wait, wait for workflow to complete
+    if args.wait and not images_ready and status == "in_progress":
+        images_ready = wait_for_workflow(owner, repo, pr_info.number)
+        if not images_ready:
+            print("\nWorkflow did not complete successfully.")
+            return 1
+    
     print(f"\nChecking if image exists: {image}")
-
-    if not check_image_exists(image):
-        print(f"Warning: Image may not exist yet: {image}")
-        print("  The PR workflow may still be building images.")
-        print("  Check: https://github.com/{owner}/{repo}/actions")
+    image_exists = check_image_exists(image)
+    
+    if image_exists:
+        print("  ✅ Image found!")
+    elif images_ready:
+        print("  ⚠️  Workflow succeeded but image not found (may need to wait for registry)")
+    else:
+        print("  ❌ Image not found")
         if not args.dry_run:
-            response = input("Continue anyway? [y/N] ")
+            print("\nOptions:")
+            print("  1. Run with --wait to wait for workflow")
+            print("  2. Continue anyway (VM will fail to pull image)")
+            print(f"  3. Check: https://github.com/{owner}/{repo}/actions")
+            response = input("\nContinue anyway? [y/N] ")
             if response.lower() != "y":
                 return 1
 
