@@ -12,7 +12,8 @@ This directory contains the new container-native build system for Olares, design
 - Supports both k3s and kubeadm deployment modes
 
 **After (Container-Native):**
-- **Only 2 bootstrap binaries** on host: `k3s` + `cni-plugins`
+- **Zero bootstrap binaries** with Quadlet approach (k3s runs as container!)
+- Or just 2 binaries with binary approach: `k3s` + `cni-plugins`
 - Everything else runs as containers
 - Standard OCI registries for distribution
 - Atomic upgrades via bootc
@@ -36,6 +37,27 @@ For the container-native build, we use **k3s mode exclusively** because:
 - Proven in production (Rancher, k3os)
 - Perfect fit for bootc-based immutable OS
 
+## Quadlet: Zero Bootstrap Binaries
+
+The ultimate container-native approach runs **k3s itself as a container** using Podman Quadlet:
+
+```
+quadlet/k3s.container  →  systemd generates  →  k3s.service
+```
+
+**Benefits:**
+- **Zero binaries** to install on host (only Podman needed, which comes with bootc)
+- **Atomic updates**: Change image tag, restart service
+- **Systemd native**: `systemctl start/stop/status k3s`
+- **Easy rollback**: Revert to previous image version
+
+**How it works:**
+1. Quadlet files placed in `/usr/share/containers/systemd/`
+2. systemd generator converts `.container` → `.service` at boot
+3. k3s runs as privileged container with required mounts
+
+See `quadlet/README.md` for details.
+
 ## Files
 
 | File | Purpose |
@@ -43,7 +65,10 @@ For the container-native build, we use **k3s mode exclusively** because:
 | `dependencies.yaml` | Single source of truth for all dependencies |
 | `parse-dependencies.py` | Tool to parse manifest and generate outputs |
 | `Containerfile.installer` | Installer runs as container |
-| `Containerfile.olares-os` | Bootc-based OS image with k3s |
+| `Containerfile.olares-os` | Bootc-based OS image with k3s binary |
+| `quadlet/` | **Quadlet units for running k3s as container** |
+| `quadlet/k3s.container` | k3s Quadlet unit (zero binaries approach) |
+| `quadlet/k3s-data.volume` | Persistent volume for k3s data |
 
 ## Dependency Categories
 
@@ -121,11 +146,17 @@ This provides:
 - Install process runs inside container
 - Only bootstrap binaries on host
 
-### Phase 4: Bootc OS Image
+### Phase 4: Bootc OS Image (Binary Approach)
 - Create `Containerfile.olares-os`
 - k3s baked into the image (only bootstrap binary needed)
 - CNI plugins included for Calico
 - Atomic upgrades via `bootc upgrade`
+
+### Phase 5: Quadlet Approach (Zero Binaries) 🆕
+- Create `quadlet/k3s.container` unit
+- k3s runs as privileged container
+- No bootstrap binaries needed on host
+- Systemd manages container lifecycle
 
 ## Comparison with Legacy
 
@@ -168,12 +199,13 @@ spec:
 
 ## Benefits
 
-| Aspect | Legacy | Container-Native |
-|--------|--------|------------------|
-| Host binaries | 22+ | **2** (k3s + cni-plugins) |
-| Integrity verification | None | SHA256 checksums |
-| Multi-arch | Separate URLs | Single manifest |
-| Updates | Re-download binary | `bootc upgrade` |
-| Offline install | Package all binaries | Package images only |
-| Security scanning | Manual | Standard container scanning |
-| Deployment modes | k3s OR kubeadm | k3s only (simpler) |
+| Aspect | Legacy | Container-Native (binary) | Container-Native (Quadlet) |
+|--------|--------|---------------------------|----------------------------|
+| Host binaries | 22+ | 2 (k3s + cni-plugins) | **0** (k3s is a container!) |
+| Integrity verification | None | SHA256 checksums | Image signatures |
+| Multi-arch | Separate URLs | Single manifest | Single image manifest |
+| Updates | Re-download binary | `bootc upgrade` | `podman pull` + restart |
+| Offline install | Package all binaries | Package images only | Package images only |
+| Security scanning | Manual | Standard scanning | Standard scanning |
+| Deployment modes | k3s OR kubeadm | k3s only | k3s only |
+| Rollback | Manual | bootc rollback | Image tag revert |
