@@ -173,6 +173,7 @@ setup_network() {
     iptables -A FORWARD -o br0 -m state --state RELATED,ESTABLISHED -j ACCEPT
     
     # Start dnsmasq for DHCP and DNS
+    # Use fixed MAC address 52:54:00:12:34:56 (same as QEMU VM)
     mkdir -p /var/run/dnsmasq
     cat > /var/run/dnsmasq/dnsmasq.conf << EOF
 interface=br0
@@ -180,7 +181,7 @@ bind-interfaces
 dhcp-range=${VM_DHCP_START},${VM_DHCP_END},12h
 dhcp-option=option:router,${VM_BRIDGE_IP}
 dhcp-option=option:dns-server,${VM_BRIDGE_IP}
-dhcp-host=*,${VM_HOSTNAME},${VM_DHCP_START}
+dhcp-host=52:54:00:12:34:56,${VM_HOSTNAME},${VM_DHCP_START}
 address=/${VM_HOSTNAME}/${VM_DHCP_START}
 log-queries
 log-dhcp
