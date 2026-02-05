@@ -53,7 +53,8 @@ jobs:
       - name: Determine registry
         id: registry
         run: |
-          PREFIX="${{ env.REGISTRY_PREFIX }}"
+          # Registry names must be lowercase for GHCR
+          PREFIX=$(echo "${{ env.REGISTRY_PREFIX }}" | tr '[:upper:]' '[:lower:]')
           TAG="pr-${{ env.PR_NUMBER }}"
           echo "prefix=${PREFIX}" >> $GITHUB_OUTPUT
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
