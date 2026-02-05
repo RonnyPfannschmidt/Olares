@@ -1,0 +1,206 @@
+# Containerfile.netinstall
+#
+# Minimal bootable image for Olares network installation.
+# This image boots quickly and then rebases to the full Olares OS image
+# from a configurable registry on first boot.
+#
+# Use cases:
+# - PR testing: Point to ghcr.io/<fork>/olares-os:pr-123
+# - Development: Point to local registry
+# - Production: Point to official ghcr.io/olares/os:latest
+#
+# Build:
+#   podman build \
+#     --build-arg OLARES_REGISTRY=ghcr.io/myuser \
+#     --build-arg OLARES_TAG=pr-123 \
+#     -t olares-netinstall:pr-123 \
+#     -f Containerfile.netinstall .
+#
+# Create VM:
+#   sudo podman run --rm --privileged \
+#     -v ./output:/output \
+#     quay.io/centos-bootc/bootc-image-builder:latest \
+#     --type qcow2 \
+#     olares-netinstall:pr-123
+#
+# Boot the VM and it will:
+#   1. Start minimal CentOS bootc system
+#   2. On first boot, run olares-rebase service
+#   3. Rebase to full Olares OS image from registry
+#   4. Reboot into full Olares
+
+FROM quay.io/centos-bootc/centos-bootc:stream9
+
+# =============================================================================
+# Build Arguments - Configure target registry and version
+# =============================================================================
+ARG OLARES_REGISTRY=ghcr.io/olares
+ARG OLARES_TAG=latest
+ARG OLARES_IMAGE=os
+
+# Store build args in labels and files for runtime access
+LABEL org.opencontainers.image.title="Olares Netinstall"
+LABEL org.opencontainers.image.description="Minimal installer that rebases to full Olares OS on first boot"
+LABEL org.opencontainers.image.source="https://github.com/beclab/Olares"
+LABEL olares.registry="${OLARES_REGISTRY}"
+LABEL olares.image="${OLARES_IMAGE}"
+LABEL olares.tag="${OLARES_TAG}"
+
+# =============================================================================
+# Netinstall Configuration
+# =============================================================================
+
+# Store target image configuration
+RUN mkdir -p /etc/olares
+COPY <<EOF /etc/olares/netinstall.conf
+# Olares Netinstall Configuration
+# Generated at build time, can be overridden before first boot
+
+OLARES_REGISTRY=${OLARES_REGISTRY}
+OLARES_IMAGE=${OLARES_IMAGE}
+OLARES_TAG=${OLARES_TAG}
+EOF
+
+# =============================================================================
+# First Boot Rebase Service
+# =============================================================================
+
+# Systemd service that runs on first boot
+COPY <<'SERVICE' /usr/lib/systemd/system/olares-rebase.service
+[Unit]
+Description=Olares First Boot - Rebase to full OS image
+Documentation=https://github.com/beclab/Olares
+ConditionPathExists=!/etc/olares/.rebased
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/olares-rebase
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+# Rebase script
+COPY <<'SCRIPT' /usr/local/bin/olares-rebase
+#!/bin/bash
+#
+# Olares Netinstall Rebase Script
+# Runs on first boot to switch from netinstall to full Olares OS
+#
+set -euo pipefail
+
+CONFIG_FILE="/etc/olares/netinstall.conf"
+MARKER_FILE="/etc/olares/.rebased"
+
+log() {
+    echo "[olares-rebase] $(date -Iseconds) $*"
+}
+
+# Load configuration
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+else
+    log "ERROR: Configuration file not found: $CONFIG_FILE"
+    exit 1
+fi
+
+# Construct full image reference
+FULL_IMAGE="${OLARES_REGISTRY}/olares-${OLARES_IMAGE}:${OLARES_TAG}"
+
+log "============================================"
+log "Olares Netinstall - First Boot Rebase"
+log "============================================"
+log "Target image: ${FULL_IMAGE}"
+log ""
+
+# Check if already rebased
+if [[ -f "$MARKER_FILE" ]]; then
+    log "System already rebased, skipping"
+    exit 0
+fi
+
+# Wait for network
+log "Waiting for network..."
+for i in {1..30}; do
+    if ping -c1 -W1 ghcr.io &>/dev/null || ping -c1 -W1 8.8.8.8 &>/dev/null; then
+        log "Network is available"
+        break
+    fi
+    sleep 2
+done
+
+# Perform rebase
+log "Rebasing to ${FULL_IMAGE}..."
+log "This may take several minutes depending on network speed."
+log ""
+
+if bootc switch --transport registry "${FULL_IMAGE}"; then
+    log "Rebase successful!"
+    
+    # Mark as rebased
+    echo "rebased=$(date -Iseconds)" > "$MARKER_FILE"
+    echo "image=${FULL_IMAGE}" >> "$MARKER_FILE"
+    
+    log ""
+    log "System will reboot in 10 seconds to apply changes..."
+    log "After reboot, you will be running Olares OS."
+    sleep 10
+    
+    systemctl reboot
+else
+    log "ERROR: Rebase failed!"
+    log "Check network connectivity and image availability."
+    log "You can retry manually with: bootc switch ${FULL_IMAGE}"
+    exit 1
+fi
+SCRIPT
+
+RUN chmod +x /usr/local/bin/olares-rebase \
+    && systemctl enable olares-rebase.service
+
+# =============================================================================
+# Status Check Script
+# =============================================================================
+
+COPY <<'STATUS' /usr/local/bin/olares-netinstall-status
+#!/bin/bash
+# Show netinstall status and configuration
+
+CONFIG_FILE="/etc/olares/netinstall.conf"
+MARKER_FILE="/etc/olares/.rebased"
+
+echo "Olares Netinstall Status"
+echo "========================"
+echo ""
+
+if [[ -f "$MARKER_FILE" ]]; then
+    echo "Status: REBASED (full Olares OS)"
+    cat "$MARKER_FILE"
+else
+    echo "Status: NETINSTALL (waiting for first boot rebase)"
+    echo ""
+    echo "Configuration:"
+    cat "$CONFIG_FILE"
+    echo ""
+    echo "The system will rebase to full Olares OS on first boot."
+    echo "To trigger manually: systemctl start olares-rebase"
+fi
+STATUS
+
+RUN chmod +x /usr/local/bin/olares-netinstall-status
+
+# =============================================================================
+# Minimal packages (keep image small)
+# =============================================================================
+
+# Only add what's needed for rebase
+RUN dnf install -y \
+    iproute \
+    iputils \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf

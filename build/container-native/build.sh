@@ -137,6 +137,27 @@ generate_images_list() {
     log_info "Generated: ${BUILD_DIR}/images.txt"
 }
 
+# Build netinstall image (minimal image that rebases to full OS on first boot)
+build_netinstall() {
+    log_step "Building netinstall image..."
+    
+    local image="${REGISTRY}/netinstall:${VERSION}"
+    local target_registry="${TARGET_REGISTRY:-$REGISTRY}"
+    local target_tag="${TARGET_TAG:-$VERSION}"
+    
+    $RUNTIME build \
+        --platform "$PLATFORM" \
+        --build-arg "OLARES_REGISTRY=${target_registry}" \
+        --build-arg "OLARES_TAG=${target_tag}" \
+        --build-arg "OLARES_IMAGE=os" \
+        -t "$image" \
+        -f "${SCRIPT_DIR}/Containerfile.netinstall" \
+        "${SCRIPT_DIR}"
+    
+    log_info "Built: $image"
+    log_info "This image will rebase to: ${target_registry}/olares-os:${target_tag} on first boot"
+}
+
 # Build bootable ISO (requires sudo and bootc-image-builder)
 build_iso() {
     log_step "Building bootable ISO..."
@@ -168,6 +189,37 @@ build_iso() {
     log_info "ISO generated in: $output_dir"
 }
 
+# Build QCOW2 VM image
+build_qcow2() {
+    log_step "Building QCOW2 VM image..."
+    
+    local image="${1:-${REGISTRY}/os:${VERSION}}"
+    local output_dir="${BUILD_DIR}/vm"
+    
+    mkdir -p "$output_dir"
+    
+    if [[ "$RUNTIME" == "podman" ]]; then
+        sudo podman run --rm --privileged \
+            --security-opt label=type:unconfined_t \
+            -v "${output_dir}:/output" \
+            -v /var/lib/containers/storage:/var/lib/containers/storage \
+            quay.io/centos-bootc/bootc-image-builder:latest \
+            --type qcow2 \
+            --output /output \
+            "$image"
+    else
+        sudo docker run --rm --privileged \
+            -v "${output_dir}:/output" \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            quay.io/centos-bootc/bootc-image-builder:latest \
+            --type qcow2 \
+            --output /output \
+            "$image"
+    fi
+    
+    log_info "QCOW2 generated in: $output_dir"
+}
+
 # Push images to registry
 push_images() {
     log_step "Pushing images to registry..."
@@ -196,17 +248,21 @@ Commands:
     all             Build everything (installer + OS + wrappers)
     installer       Build installer container image
     os              Build bootc OS image
+    netinstall      Build netinstall image (minimal, rebases on first boot)
     wrappers        Generate tool wrapper scripts
     images-list     Generate list of container images
     iso             Build bootable ISO (requires root)
+    qcow2           Build QCOW2 VM image (requires root)
     push            Push images to registry
     clean           Remove build artifacts
     help            Show this help
 
 Options:
-    VERSION=x.y.z   Set version (default: dev)
-    REGISTRY=...    Set registry (default: ghcr.io/olares)
-    PLATFORM=...    Set platform (default: linux/amd64)
+    VERSION=x.y.z       Set version (default: dev)
+    REGISTRY=...        Set registry (default: ghcr.io/olares)
+    PLATFORM=...        Set platform (default: linux/amd64)
+    TARGET_REGISTRY=... Registry the netinstall will pull from (for PR testing)
+    TARGET_TAG=...      Tag the netinstall will pull (for PR testing)
 
 Examples:
     # Build everything
@@ -215,11 +271,26 @@ Examples:
     # Build only the OS image
     ./build.sh os
 
+    # Build netinstall pointing to a PR
+    TARGET_REGISTRY=ghcr.io/myuser TARGET_TAG=pr-123 ./build.sh netinstall
+
     # Build and push
     VERSION=1.0.0 ./build.sh all && ./build.sh push
 
     # Generate ISO
     sudo VERSION=1.0.0 ./build.sh iso
+
+    # Generate QCOW2 for testing in VM
+    sudo VERSION=1.0.0 ./build.sh qcow2
+
+PR Testing:
+    # Build netinstall that points to PR images
+    TARGET_REGISTRY=ghcr.io/contributor TARGET_TAG=pr-42 ./build.sh netinstall
+    
+    # Build QCOW2 from netinstall
+    sudo ./build.sh qcow2 \${REGISTRY}/netinstall:\${VERSION}
+    
+    # Boot VM - it will automatically pull full image on first boot
 
 EOF
 }
@@ -229,6 +300,7 @@ main() {
     mkdir -p "$BUILD_DIR"
     
     local command="${1:-help}"
+    shift || true
     
     case "$command" in
         all)
@@ -243,6 +315,9 @@ main() {
         os)
             build_os
             ;;
+        netinstall)
+            build_netinstall
+            ;;
         wrappers)
             build_wrappers
             ;;
@@ -252,6 +327,9 @@ main() {
         iso)
             build_os
             build_iso
+            ;;
+        qcow2)
+            build_qcow2 "$@"
             ;;
         push)
             push_images

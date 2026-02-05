@@ -217,3 +217,72 @@ spec:
 | Security scanning | Manual | Standard scanning | Standard scanning |
 | Deployment modes | k3s OR kubeadm | k3s only | k3s only |
 | Rollback | Manual | bootc rollback | Image tag revert |
+
+## PR Testing Workflow
+
+The `.github/workflows/pr-build-images.yaml` workflow builds all images on PRs:
+
+### How It Works
+
+1. **Images are built on PR** to contributor's GHCR namespace:
+   ```
+   ghcr.io/<fork-owner>/olares-os:pr-123
+   ghcr.io/<fork-owner>/olares-installer:pr-123
+   ghcr.io/<fork-owner>/olares-netinstall:pr-123
+   ```
+
+2. **PR comment** is posted with image URLs and test instructions
+
+3. **Add `build-vm` label** to automatically generate QCOW2 artifact
+
+### Testing a PR Locally
+
+```bash
+# Pull images from PR
+podman pull ghcr.io/<contributor>/olares-os:pr-123
+
+# Build QCOW2 from PR images
+sudo podman run --rm --privileged \
+  -v ./output:/output \
+  quay.io/centos-bootc/bootc-image-builder:latest \
+  --type qcow2 \
+  ghcr.io/<contributor>/olares-os:pr-123
+
+# Boot VM
+virt-install --name olares-pr-123 \
+  --memory 4096 --vcpus 2 \
+  --disk ./output/image.qcow2 \
+  --import --os-variant centos-stream9
+```
+
+## Netinstall Image
+
+The `Containerfile.netinstall` creates a minimal bootable image that:
+1. Boots quickly with minimal footprint
+2. On first boot, rebases to the full Olares OS from a registry
+3. Reboots into the full system
+
+### Build Netinstall
+
+```bash
+# Build netinstall pointing to official images
+./build.sh netinstall
+
+# Build netinstall pointing to PR images
+TARGET_REGISTRY=ghcr.io/contributor TARGET_TAG=pr-123 ./build.sh netinstall
+```
+
+### Netinstall Flow
+
+```
+┌─────────────────┐    ┌──────────────────────┐    ┌─────────────────┐
+│  Boot netinstall │ -> │ First boot: rebase   │ -> │ Reboot into     │
+│  (minimal image) │    │ to full Olares OS    │    │ full Olares     │
+└─────────────────┘    └──────────────────────┘    └─────────────────┘
+```
+
+### Use Cases
+
+- **PR Testing**: Build netinstall pointing to PR registry, create VM, test
+- **Custom Deployments**: Point netinstall to internal registry
+- **Network Install**: Small ISO that pulls full image over network
