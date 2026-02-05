@@ -1,10 +1,11 @@
 # Olares Container-Native Dependencies
 # 
-# This manifest separates dependencies into:
-# - bootstrap: Minimal binaries required on host to start container runtime
+# This manifest defines dependencies for the container-native Olares OS:
+# - bootstrap: Only 2 binaries needed (k3s + cni-plugins)
 # - images: Everything else runs as containers
+# - system: Kernel modules and system packages (optional)
 #
-# Migration from legacy .olares/Olares.yaml format
+# k3s includes containerd, kubelet, kubectl, crictl, ctr in a single binary.
 
 apiVersion: olares.com/v1alpha1
 kind: DependencyManifest
@@ -14,38 +15,39 @@ metadata:
 
 spec:
   # ==========================================================================
-  # BOOTSTRAP BINARIES
-  # These MUST be installed on the host - they bootstrap the container runtime
+  # BOOTSTRAP BINARIES (k3s mode - MINIMAL)
+  # 
+  # k3s includes: containerd, kubelet, kubectl, crictl, ctr
+  # We only need k3s + cni-plugins (for Calico, since k3s uses flannel by default)
+  # Helm can run as a container!
   # ==========================================================================
   bootstrap:
-    # Container runtime (chicken-and-egg: need this to run containers)
-    - id: containerd
-      version: "2.1.3"
-      description: "Container runtime daemon"
+    # k3s: Single binary that includes everything
+    # - containerd (container runtime)
+    # - kubelet (node agent)  
+    # - kubectl (CLI, via symlink)
+    # - crictl, ctr (container tools)
+    - id: k3s
+      version: "1.33.3+k3s1"
+      description: "Lightweight Kubernetes (includes containerd, kubelet, kubectl)"
       installPath: /usr/local/bin
       artifacts:
         linux/amd64:
-          url: https://github.com/containerd/containerd/releases/download/v2.1.3/containerd-2.1.3-linux-amd64.tar.gz
+          url: https://github.com/k3s-io/k3s/releases/download/v1.33.3+k3s1/k3s
           sha256: ""  # TODO: Add checksum
         linux/arm64:
-          url: https://github.com/containerd/containerd/releases/download/v2.1.3/containerd-2.1.3-linux-arm64.tar.gz
+          url: https://github.com/k3s-io/k3s/releases/download/v1.33.3+k3s1/k3s-arm64
           sha256: ""
+      symlinks:
+        - kubectl
+        - crictl
+        - ctr
 
-    - id: runc
-      version: "1.2.5"
-      description: "OCI runtime"
-      installPath: /usr/local/bin
-      artifacts:
-        linux/amd64:
-          url: https://github.com/opencontainers/runc/releases/download/v1.2.5/runc.amd64
-          sha256: ""
-        linux/arm64:
-          url: https://github.com/opencontainers/runc/releases/download/v1.2.5/runc.arm64
-          sha256: ""
-
+    # CNI plugins for Calico networking
+    # (k3s includes flannel, but Olares uses Calico for network policies)
     - id: cni-plugins
       version: "1.6.2"
-      description: "Container Network Interface plugins"
+      description: "Container Network Interface plugins (for Calico)"
       installPath: /opt/cni/bin
       artifacts:
         linux/amd64:
@@ -54,33 +56,6 @@ spec:
         linux/arm64:
           url: https://github.com/containernetworking/plugins/releases/download/v1.6.2/cni-plugins-linux-arm64-v1.6.2.tgz
           sha256: ""
-
-    # Kubernetes node agent (manages pods on host)
-    - id: kubelet
-      version: "1.33.3"
-      description: "Kubernetes node agent"
-      installPath: /usr/local/bin
-      artifacts:
-        linux/amd64:
-          url: https://dl.k8s.io/release/v1.33.3/bin/linux/amd64/kubelet
-          sha256: ""
-        linux/arm64:
-          url: https://dl.k8s.io/release/v1.33.3/bin/linux/arm64/kubelet
-          sha256: ""
-
-    # Alternative: k3s (single binary, includes everything)
-    # Uncomment this and comment out kubelet if using k3s
-    # - id: k3s
-    #   version: "1.33.3+k3s1"
-    #   description: "Lightweight Kubernetes"
-    #   installPath: /usr/local/bin
-    #   artifacts:
-    #     linux/amd64:
-    #       url: https://github.com/k3s-io/k3s/releases/download/v1.33.3+k3s1/k3s
-    #       sha256: ""
-    #     linux/arm64:
-    #       url: https://github.com/k3s-io/k3s/releases/download/v1.33.3+k3s1/k3s-arm64
-    #       sha256: ""
 
   # ==========================================================================
   # CONTAINER IMAGES
@@ -119,56 +94,44 @@ spec:
       required: true
 
     # -------------------------------------------------------------------------
-    # CLI Tools (run as containers, replace binary downloads)
+    # CLI Tools (run as containers)
+    # NOTE: k3s provides kubectl/crictl via symlinks on the host, but these
+    # container images are useful for the installer and containerized workflows
     # -------------------------------------------------------------------------
     - image: bitnami/kubectl:1.33.3
-      description: "Kubernetes CLI"
+      description: "Kubernetes CLI (for installer container)"
       alias: kubectl
-      replaces: "infrastructure/kubernetes kubectl binary"
 
     - image: alpine/helm:3.17.1
       description: "Kubernetes package manager"
       alias: helm
-      replaces: "infrastructure/helm binary"
 
     - image: quay.io/coreos/etcd:v3.5.18
-      description: "etcd CLI tools"
+      description: "etcd CLI tools (etcdctl)"
       alias: etcdctl
-      replaces: "infrastructure/etcd binary"
-
-    - image: registry.k8s.io/cri-tools/crictl:v1.32.0
-      description: "Container runtime CLI"
-      alias: crictl
-      replaces: "infrastructure/cri-tools binary"
 
     # -------------------------------------------------------------------------
-    # Storage & Backup (run as containers)
+    # Storage & Backup
     # -------------------------------------------------------------------------
     - image: minio/minio:RELEASE.2023-05-04T21-44-30Z
       description: "Object storage server"
-      replaces: "infrastructure/minio binary"
 
     - image: velero/velero:v1.11.3
       description: "Kubernetes backup tool"
       alias: velero
-      replaces: "platform/velero binary"
 
     - image: restic/restic:0.17.3
       description: "Backup program"
       alias: restic
-      replaces: "infrastructure/restic binary"
 
     - image: juicedata/juicefs-csi-driver:v0.24.0
       description: "JuiceFS CSI driver"
-      replaces: "platform/juicefs binary (partial)"
 
     # -------------------------------------------------------------------------
-    # Databases (already containerized in original)
+    # Databases
     # -------------------------------------------------------------------------
     - image: redis:5.0.14-alpine
       description: "In-memory data store"
-      # NOTE: This replaces BOTH the redis container AND the redis binary
-      # The binary in platform/redis is now redundant
 
     - image: postgres:15-alpine
       description: "PostgreSQL database"
@@ -182,7 +145,6 @@ spec:
     - image: alpine/socat:1.7.4.4
       description: "Multipurpose relay"
       alias: socat
-      replaces: "infrastructure/socat binary"
 
     - image: curlimages/curl:8.5.0
       description: "HTTP client"
@@ -204,10 +166,9 @@ spec:
       description: "RBAC proxy"
 
     # -------------------------------------------------------------------------
-    # Additional images from original manifests
-    # (These were already containers, just consolidating here)
-    # -------------------------------------------------------------------------
+    # Additional Olares images
     # TODO: Import remaining images from .olares/Olares.yaml containers sections
+    # -------------------------------------------------------------------------
 
   # ==========================================================================
   # KERNEL/SYSTEM REQUIREMENTS
@@ -231,52 +192,3 @@ spec:
       condition: "gpu.vendor == 'nvidia'"
       # Installed via package manager, not direct download
 
-  # ==========================================================================
-  # DEPRECATED BINARIES
-  # These were in the old format but are now replaced by containers above
-  # Kept here for reference during migration
-  # ==========================================================================
-  deprecated:
-    - id: kubeadm
-      reason: "Use registry.k8s.io/kubeadm container or k3s"
-      replacedBy: "k3s bootstrap or kubeadm container"
-
-    - id: kubectl
-      reason: "Use bitnami/kubectl:1.33.3 container"
-      replacedBy: "images[alias=kubectl]"
-
-    - id: helm
-      reason: "Use alpine/helm:3.17.1 container"
-      replacedBy: "images[alias=helm]"
-
-    - id: etcd
-      reason: "Runs as pod in control plane"
-      replacedBy: "images[registry.k8s.io/etcd]"
-
-    - id: minio-binary
-      reason: "Use minio/minio container"
-      replacedBy: "images[minio/minio]"
-
-    - id: redis-binary
-      reason: "Use redis:5.0.14-alpine container"
-      replacedBy: "images[redis]"
-
-    - id: velero-binary
-      reason: "Use velero/velero container"
-      replacedBy: "images[alias=velero]"
-
-    - id: restic-binary
-      reason: "Use restic/restic container"
-      replacedBy: "images[alias=restic]"
-
-    - id: socat-binary
-      reason: "Use alpine/socat container"
-      replacedBy: "images[alias=socat]"
-
-    - id: conntrack-tools
-      reason: "Available in base OS or as container"
-      replacedBy: "Base OS package or init container"
-
-    - id: apparmor
-      reason: "System package, not direct download"
-      replacedBy: "Base OS package"

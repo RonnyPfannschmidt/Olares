@@ -62,21 +62,32 @@ RUN dnf install -y \
     && rm -rf /var/cache/dnf
 
 # =============================================================================
-# k3s Installation
+# Bootstrap Binaries Installation
+#
+# Only 2 binaries are needed for the container-native OS:
+# 1. k3s - includes containerd, kubelet, kubectl, crictl, ctr
+# 2. CNI plugins - for Calico networking (k3s has flannel, but Olares uses Calico)
 # =============================================================================
 
 ARG K3S_VERSION=v1.33.3+k3s1
+ARG CNI_VERSION=v1.6.2
 ARG TARGETARCH=amd64
 
 # Download k3s binary
+# k3s is a single binary that includes: containerd, kubelet, kubectl, crictl, ctr
 RUN curl -fsSL "https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/k3s$([ \"${TARGETARCH}\" = \"arm64\" ] && echo \"-arm64\" || echo \"\")" \
     -o /usr/local/bin/k3s \
     && chmod +x /usr/local/bin/k3s
 
-# Create symlinks for kubectl, crictl, ctr
+# Create symlinks for kubectl, crictl, ctr (provided by k3s)
 RUN ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl \
     && ln -sf /usr/local/bin/k3s /usr/local/bin/crictl \
     && ln -sf /usr/local/bin/k3s /usr/local/bin/ctr
+
+# Download CNI plugins (required for Calico)
+RUN mkdir -p /opt/cni/bin \
+    && curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-${TARGETARCH}-${CNI_VERSION}.tgz" \
+    | tar -xz -C /opt/cni/bin
 
 # k3s configuration directory
 RUN mkdir -p /etc/rancher/k3s
@@ -85,12 +96,21 @@ RUN mkdir -p /etc/rancher/k3s
 COPY <<'EOF' /etc/rancher/k3s/config.yaml
 # k3s server configuration for Olares
 write-kubeconfig-mode: "0644"
+
+# Disable k3s built-in components (Olares uses its own)
 disable:
-  - traefik       # We use our own ingress
-  - servicelb     # We use our own load balancer
+  - traefik       # Olares uses its own ingress
+  - servicelb     # Olares uses its own load balancer
+  - flannel       # Olares uses Calico for network policies
+
+# Use Calico CNI instead of flannel
+flannel-backend: none
+cni: calico
+
 tls-san:
   - "olares.local"
   - "localhost"
+
 kubelet-arg:
   - "max-pods=250"
 EOF

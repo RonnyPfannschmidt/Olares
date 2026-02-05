@@ -9,12 +9,32 @@ This directory contains the new container-native build system for Olares, design
 - Mix of host binaries and container images
 - Custom CDN hosting for all artifacts
 - Complex multi-architecture binary management
+- Supports both k3s and kubeadm deployment modes
 
 **After (Container-Native):**
-- Only 4 bootstrap binaries on host (containerd, runc, CNI, kubelet)
+- **Only 2 bootstrap binaries** on host: `k3s` + `cni-plugins`
 - Everything else runs as containers
 - Standard OCI registries for distribution
-- Atomic upgrades via bootc (future)
+- Atomic upgrades via bootc
+- k3s mode exclusively (simpler, k3s includes containerd+kubelet+kubectl)
+
+## Why k3s?
+
+The legacy Olares supports two deployment modes:
+1. **kubeadm mode**: Requires containerd, runc, kubelet, kubeadm, kubectl, cni-plugins (6+ binaries)
+2. **k3s mode**: Requires only k3s + cni-plugins (2 binaries!)
+
+k3s is a single binary that includes:
+- `containerd` (container runtime)
+- `kubelet` (node agent)
+- `kubectl` (CLI, via symlink)
+- `crictl`, `ctr` (container tools)
+
+For the container-native build, we use **k3s mode exclusively** because:
+- Minimal bootstrap requirements
+- Single binary to update
+- Proven in production (Rancher, k3os)
+- Perfect fit for bootc-based immutable OS
 
 ## Files
 
@@ -22,17 +42,15 @@ This directory contains the new container-native build system for Olares, design
 |------|---------|
 | `dependencies.yaml` | Single source of truth for all dependencies |
 | `parse-dependencies.py` | Tool to parse manifest and generate outputs |
-| `Containerfile.installer` | (TODO) Installer runs as container |
-| `Containerfile.olares-os` | (TODO) Bootc-based OS image |
+| `Containerfile.installer` | Installer runs as container |
+| `Containerfile.olares-os` | Bootc-based OS image with k3s |
 
 ## Dependency Categories
 
 ### Bootstrap Binaries (Must be on host)
-These bootstrap the container runtime - you need them to run containers:
-- `containerd` - Container runtime daemon
-- `runc` - OCI runtime
-- `cni-plugins` - Container networking
-- `kubelet` - Kubernetes node agent (or `k3s` as alternative)
+Only 2 binaries needed for container-native k3s mode:
+- `k3s` - Lightweight Kubernetes (includes containerd, kubelet, kubectl)
+- `cni-plugins` - For Calico networking (k3s has flannel built-in, but Olares uses Calico)
 
 ### Container Images (Everything else)
 All other tools run as containers:
@@ -105,7 +123,8 @@ This provides:
 
 ### Phase 4: Bootc OS Image
 - Create `Containerfile.olares-os`
-- k3s pre-installed in image
+- k3s baked into the image (only bootstrap binary needed)
+- CNI plugins included for Calico
 - Atomic upgrades via `bootc upgrade`
 
 ## Comparison with Legacy
@@ -128,27 +147,33 @@ output:
 ```yaml
 spec:
   bootstrap:
-    # Only truly required host binaries
-    - id: kubelet
-      version: "1.33.3"
+    # Only 2 binaries needed!
+    - id: k3s
+      version: "1.33.3+k3s1"
+      description: "Includes containerd, kubelet, kubectl"
       artifacts:
         linux/amd64:
-          url: https://dl.k8s.io/.../kubelet
+          url: https://github.com/k3s-io/k3s/releases/.../k3s
           sha256: abc123...  # Integrity verification!
+      symlinks: [kubectl, crictl, ctr]
+    - id: cni-plugins
+      version: "1.6.2"
+      description: "For Calico networking"
   images:
-    # kubectl is now a container
-    - image: bitnami/kubectl:1.33.3
-      alias: kubectl
-      replaces: "infrastructure/kubernetes kubectl binary"
+    # helm runs as container instead of host binary
+    - image: alpine/helm:3.17.1
+      alias: helm
+      replaces: "infrastructure/kubernetes helm binary"
 ```
 
 ## Benefits
 
 | Aspect | Legacy | Container-Native |
 |--------|--------|------------------|
-| Host binaries | 22+ | 4 |
+| Host binaries | 22+ | **2** (k3s + cni-plugins) |
 | Integrity verification | None | SHA256 checksums |
 | Multi-arch | Separate URLs | Single manifest |
-| Updates | Re-download binary | `podman pull` |
+| Updates | Re-download binary | `bootc upgrade` |
 | Offline install | Package all binaries | Package images only |
 | Security scanning | Manual | Standard container scanning |
+| Deployment modes | k3s OR kubeadm | k3s only (simpler) |
