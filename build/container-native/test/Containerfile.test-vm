@@ -35,12 +35,14 @@ FROM fedora:41
 LABEL org.opencontainers.image.title="Olares Test VM Runner"
 LABEL org.opencontainers.image.description="Runs Olares in a VM with auto-update on boot"
 
-# Install QEMU and tools
+# Install QEMU, virtiofsd, and tools
 RUN dnf install -y \
     qemu-system-x86 \
     qemu-img \
+    virtiofsd \
     cloud-utils-growpart \
     podman \
+    skopeo \
     curl \
     jq \
     && dnf clean all
@@ -63,6 +65,11 @@ ENV VM_VNC_PORT=5900
 
 # Disk path (must be mounted from host for persistence)
 ENV VM_DISK=/vm/disk.qcow2
+
+# Share container storage with guest via virtiofs
+# When enabled, host podman storage is shared with the VM
+# Requires: -v ~/.local/share/containers/storage:/var/lib/containers/storage:O
+ENV VM_SHARE_STORAGE=true
 
 # =============================================================================
 # Scripts

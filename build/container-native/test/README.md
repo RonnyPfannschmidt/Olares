@@ -189,32 +189,37 @@ When you push new commits:
 
 ## Tips
 
-### Share Host Podman Storage (Avoid Re-downloading)
+### Share Host Container Storage (True Storage Sharing)
 
-To avoid re-downloading images that already exist on your host:
+The Olares OS uses **podman as the container runtime** (via cri-dockerd), which means
+the guest VM uses the same storage format as the host. You can share storage via virtiofs:
 
 ```bash
-# Rootless podman (most common)
+# Share host storage with guest (requires virtiofs support)
 podman run --rm -it --privileged \
     --device /dev/kvm \
     -v ~/olares-test-data:/vm \
-    -v ~/.local/share/containers/storage:/var/lib/containers/storage:O \
+    -v ~/.local/share/containers/storage:/shared-storage:ro \
+    -e VM_SHARE_STORAGE=true \
     -e OLARES_REGISTRY=ghcr.io/myuser \
     -e OLARES_TAG=pr-123 \
     olares-test-vm
-
-# Rootful podman (if running as root)
-sudo podman run --rm -it --privileged \
-    --device /dev/kvm \
-    -v ~/olares-test-data:/vm \
-    -v /var/lib/containers/storage:/var/lib/containers/storage:O \
-    ...
 ```
 
+**How it works:**
+1. Host podman storage mounted into test-vm container
+2. virtiofs shares `/shared-storage` to guest at `/var/lib/containers/storage`
+3. Guest's k3s (via cri-dockerd → podman) uses the shared storage
+4. Images already pulled on host are immediately available in guest!
+
+**Benefits:**
+- No duplicate image downloads
+- Faster VM startup (images already present)
+- Less disk space usage
+
 **Notes:**
-- `:O` creates an overlay mount (host storage is read-only base)
-- `bootc-image-builder` inside the container will reuse cached images
 - Requires matching storage driver (usually `overlay`)
+- Guest storage is read-only from shared; writes go to local overlay
 
 ### Faster Iteration
 

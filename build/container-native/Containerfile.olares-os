@@ -53,7 +53,8 @@ RUN dnf install -y \
     procps-ng \
     util-linux \
     which \
-    # Container tools (for debugging)
+    # Container tools - podman is our CRI backend
+    podman \
     skopeo \
     # Filesystem
     e2fsprogs \
@@ -63,28 +64,123 @@ RUN dnf install -y \
     && rm -rf /var/cache/dnf
 
 # =============================================================================
-# Quadlet: k3s runs as a container
+# cri-dockerd: CRI adapter for podman
 #
-# k3s runs as a systemd-managed container via Podman Quadlet:
-# - Atomic updates via container image tags
-# - OCI image signatures for verification
-# - Consistent across architectures
+# cri-dockerd provides a CRI (Container Runtime Interface) socket that k3s
+# kubelet connects to. cri-dockerd then talks to podman via Docker-compatible API.
 #
-# CNI plugins are baked into this image (required for Calico networking).
-# Calico is deployed separately and uses these base CNI plugins.
+# Flow: k3s kubelet → cri-dockerd → podman.socket → podman → containers
 # =============================================================================
 
-# Install Quadlet unit files for k3s
-# These define how systemd manages the k3s container
-COPY quadlet/k3s.container /usr/share/containers/systemd/k3s.container
-COPY quadlet/k3s-data.volume /usr/share/containers/systemd/k3s-data.volume
+# Download and install cri-dockerd
+ARG CRI_DOCKERD_VERSION=0.3.16
+RUN curl -fsSL -o /tmp/cri-dockerd.tgz \
+    "https://github.com/Mirantis/cri-dockerd/releases/download/v${CRI_DOCKERD_VERSION}/cri-dockerd-${CRI_DOCKERD_VERSION}.amd64.tgz" \
+    && tar -xzf /tmp/cri-dockerd.tgz -C /tmp \
+    && mv /tmp/cri-dockerd/cri-dockerd /usr/local/bin/ \
+    && chmod +x /usr/local/bin/cri-dockerd \
+    && rm -rf /tmp/cri-dockerd.tgz /tmp/cri-dockerd
+
+# cri-dockerd systemd service - connects to podman socket
+COPY <<'EOF' /usr/lib/systemd/system/cri-dockerd.service
+[Unit]
+Description=CRI Interface for Podman
+Documentation=https://github.com/Mirantis/cri-dockerd
+After=podman.socket
+Requires=podman.socket
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/cri-dockerd --container-runtime-endpoint=unix:///run/podman/podman.sock --pod-infra-container-image=registry.k8s.io/pause:3.10
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# cri-dockerd socket for kubelet
+COPY <<'EOF' /usr/lib/systemd/system/cri-dockerd.socket
+[Unit]
+Description=CRI Docker Socket for the API
+PartOf=cri-dockerd.service
+
+[Socket]
+ListenStream=/run/cri-dockerd.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=root
+
+[Install]
+WantedBy=sockets.target
+EOF
+
+# Enable podman socket and cri-dockerd
+RUN systemctl enable podman.socket \
+    && systemctl enable cri-dockerd.service \
+    && systemctl enable cri-dockerd.socket
+
+# =============================================================================
+# k3s: Lightweight Kubernetes
+#
+# k3s runs as a binary using podman as the container runtime via cri-dockerd:
+#   k3s kubelet → cri-dockerd → podman.socket → podman containers
+#
+# This enables sharing container storage with the host (via virtiofs in VMs),
+# since podman and the host use the same containers/storage format.
+# =============================================================================
+
+# Download k3s binary
+ARG K3S_VERSION=v1.32.3+k3s1
+RUN curl -fsSL -o /usr/local/bin/k3s \
+    "https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/k3s" \
+    && chmod +x /usr/local/bin/k3s \
+    && ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl \
+    && ln -sf /usr/local/bin/k3s /usr/local/bin/crictl \
+    && ln -sf /usr/local/bin/k3s /usr/local/bin/ctr
+
+# k3s systemd service - uses cri-dockerd as container runtime
+COPY <<'EOF' /usr/lib/systemd/system/k3s.service
+[Unit]
+Description=Lightweight Kubernetes
+Documentation=https://k3s.io
+After=cri-dockerd.service network-online.target
+Wants=network-online.target
+Requires=cri-dockerd.service
+
+[Service]
+Type=notify
+EnvironmentFile=-/etc/default/k3s
+EnvironmentFile=-/etc/sysconfig/k3s
+ExecStartPre=-/sbin/modprobe br_netfilter
+ExecStartPre=-/sbin/modprobe overlay
+ExecStart=/usr/local/bin/k3s server \
+    --container-runtime-endpoint=unix:///run/cri-dockerd.sock \
+    --config=/etc/rancher/k3s/config.yaml
+KillMode=process
+Delegate=yes
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+TimeoutStartSec=0
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 # Create directories that k3s/Calico will need
 RUN mkdir -p /etc/rancher/k3s \
     && mkdir -p /opt/cni/bin \
     && mkdir -p /etc/cni/net.d \
     && mkdir -p /var/lib/kubelet \
+    && mkdir -p /var/lib/rancher/k3s \
     && mkdir -p /var/log/pods
+
+# Enable k3s
+RUN systemctl enable k3s.service
 
 # =============================================================================
 # CNI Directories
@@ -97,15 +193,9 @@ RUN mkdir -p /etc/rancher/k3s \
 
 # =============================================================================
 # CLI Wrapper Scripts
-# These provide kubectl/helm commands on the host that delegate to containers
+# kubectl, crictl, ctr are symlinks to k3s binary (created above)
+# helm runs in a container
 # =============================================================================
-
-# kubectl wrapper - runs kubectl inside the k3s container
-COPY <<'EOF' /usr/local/bin/kubectl
-#!/bin/bash
-exec podman exec -i k3s kubectl "$@"
-EOF
-RUN chmod +x /usr/local/bin/kubectl
 
 # helm wrapper - runs helm in a container with kubeconfig
 COPY <<'EOF' /usr/local/bin/helm
@@ -117,21 +207,15 @@ exec podman run --rm -i \
 EOF
 RUN chmod +x /usr/local/bin/helm
 
-# crictl wrapper - runs crictl inside the k3s container
-COPY <<'EOF' /usr/local/bin/crictl
-#!/bin/bash
-exec podman exec -i k3s crictl "$@"
+# crictl config - point to cri-dockerd socket
+COPY <<'EOF' /etc/crictl.yaml
+runtime-endpoint: unix:///run/cri-dockerd.sock
+image-endpoint: unix:///run/cri-dockerd.sock
+timeout: 10
+debug: false
 EOF
-RUN chmod +x /usr/local/bin/crictl
 
-# ctr wrapper - runs ctr inside the k3s container (containerd CLI)
-COPY <<'EOF' /usr/local/bin/ctr
-#!/bin/bash
-exec podman exec -i k3s ctr "$@"
-EOF
-RUN chmod +x /usr/local/bin/ctr
-
-# k3s configuration (read by k3s container via volume mount)
+# k3s configuration
 COPY <<'EOF' /etc/rancher/k3s/config.yaml
 # k3s server configuration for Olares
 write-kubeconfig-mode: "0644"
@@ -140,6 +224,10 @@ write-kubeconfig-mode: "0644"
 disable:
   - traefik       # Olares uses its own ingress
   - servicelb     # Olares uses its own load balancer
+
+# Disable k3s embedded containerd (we use cri-dockerd → podman)
+# The container-runtime-endpoint is set in systemd service
+disable-agent: false
 
 # Disable k3s built-in flannel (Olares uses Calico)
 flannel-backend: none
@@ -163,7 +251,7 @@ COPY <<'AGENT_EOF' /usr/local/bin/olares-agent
 # Olares Bootstrap Agent
 # This script runs after k3s starts and bootstraps the Olares system
 #
-# Note: kubectl runs inside the k3s container, accessed via podman exec
+# k3s runs as a binary using podman as container runtime via cri-dockerd
 
 set -euo pipefail
 
@@ -174,11 +262,7 @@ log() {
     echo "[olares-agent] $(date -Iseconds) $*"
 }
 
-# kubectl wrapper - runs kubectl inside the k3s container
-kubectl() {
-    podman exec k3s kubectl "$@"
-}
-
+# kubectl is a symlink to k3s binary, runs directly
 # helm wrapper - runs helm inside a container with kubeconfig access
 helm() {
     podman run --rm \
@@ -189,14 +273,13 @@ helm() {
 }
 
 wait_for_k3s() {
-    log "Waiting for k3s container to be ready..."
+    log "Waiting for k3s to be ready..."
     local retries=120
     local count=0
     
-    # First wait for the k3s container to be running
+    # Wait for k3s service to be active
     while [[ $count -lt 30 ]]; do
-        if podman container exists k3s && \
-           [[ "$(podman inspect -f '{{.State.Running}}' k3s 2>/dev/null)" == "true" ]]; then
+        if systemctl is-active --quiet k3s; then
             break
         fi
         count=$((count + 1))

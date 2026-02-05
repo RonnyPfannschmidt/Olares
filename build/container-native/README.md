@@ -12,12 +12,12 @@ This directory contains the new container-native build system for Olares, design
 - Supports both k3s and kubeadm deployment modes
 
 **After (Container-Native):**
-- **Zero bootstrap binaries** with Quadlet approach (k3s runs as container!)
+- **k3s + cri-dockerd + podman**: k3s uses podman as container runtime
 - Calico CNI plugins installed by DaemonSet (from container images)
-- Everything runs as containers
+- **Shared storage**: Host and VM can share container images via virtiofs
 - Standard OCI registries for distribution
 - Atomic upgrades via bootc
-- k3s mode exclusively (simpler, k3s includes containerd+kubelet+kubectl)
+- k3s mode exclusively (simpler architecture)
 
 ## Why k3s?
 
@@ -37,26 +37,27 @@ For the container-native build, we use **k3s mode exclusively** because:
 - Proven in production (Rancher, k3os)
 - Perfect fit for bootc-based immutable OS
 
-## Quadlet: Zero Bootstrap Binaries
+## Container Runtime Architecture
 
-The ultimate container-native approach runs **k3s itself as a container** using Podman Quadlet:
+Olares uses **podman as the container runtime** for k3s, enabling storage sharing:
 
 ```
-quadlet/k3s.container  →  systemd generates  →  k3s.service
+k3s (binary) → cri-dockerd → podman.socket → podman → containers
+                                                ↓
+                                    /var/lib/containers/storage
 ```
 
 **Benefits:**
-- **Zero binaries** to install on host (only Podman needed, which comes with bootc)
-- **Atomic updates**: Change image tag, restart service
+- **Storage sharing**: Host and VM can share `/var/lib/containers/storage` via virtiofs
+- **No duplicate downloads**: Pre-pulled images on host are available in VM
+- **Standard tooling**: Use `podman` commands alongside `crictl`
 - **Systemd native**: `systemctl start/stop/status k3s`
-- **Easy rollback**: Revert to previous image version
 
-**How it works:**
-1. Quadlet files placed in `/usr/share/containers/systemd/`
-2. systemd generator converts `.container` → `.service` at boot
-3. k3s runs as privileged container with required mounts
-
-See `quadlet/README.md` for details.
+**Components:**
+1. **k3s binary**: Lightweight Kubernetes (server + kubelet)
+2. **cri-dockerd**: CRI adapter that translates kubelet requests to Docker API
+3. **podman.socket**: Systemd socket providing Docker-compatible API
+4. **podman**: Container runtime using containers/storage format
 
 ## Files
 
@@ -65,18 +66,18 @@ See `quadlet/README.md` for details.
 | `dependencies.yaml` | Single source of truth for all dependencies |
 | `parse-dependencies.py` | Tool to parse manifest and generate outputs |
 | `Containerfile.installer` | Installer runs as container |
-| `Containerfile.olares-os` | Bootc-based OS image with k3s binary |
-| `quadlet/` | **Quadlet units for running k3s as container** |
-| `quadlet/k3s.container` | k3s Quadlet unit (zero binaries approach) |
-| `quadlet/k3s-data.volume` | Persistent volume for k3s data |
+| `Containerfile.olares-os` | Bootc-based OS image with k3s + cri-dockerd + podman |
+| `Containerfile.netinstall` | Minimal image for network installation |
+| `test/` | Test VM infrastructure for PR testing |
 
-## Dependency Categories
+## Runtime Stack
 
-### Quadlet Mode (Fully Container-Native)
-- `k3s` runs as a container via Podman Quadlet
+### k3s + cri-dockerd + podman
+- `k3s` binary provides Kubernetes control plane and kubelet
+- `cri-dockerd` bridges kubelet CRI calls to Docker-compatible API
+- `podman` handles container lifecycle and storage
 - Calico CNI plugins installed by DaemonSet (from `calico/cni` image)
-- CLI tools (`kubectl`, `helm`) are wrapper scripts that exec into containers
-- **Zero host binaries** - everything comes from container images
+- CLI: `kubectl` (symlink to k3s), `helm` (runs in container), `podman` (native)
 
 ### Legacy Binary Mode (Fallback)
 For systems without Podman/Quadlet:
