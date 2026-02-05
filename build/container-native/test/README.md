@@ -189,6 +189,33 @@ When you push new commits:
 
 ## Tips
 
+### Share Host Podman Storage (Avoid Re-downloading)
+
+To avoid re-downloading images that already exist on your host:
+
+```bash
+# Rootless podman (most common)
+podman run --rm -it --privileged \
+    --device /dev/kvm \
+    -v ~/olares-test-data:/vm \
+    -v ~/.local/share/containers/storage:/var/lib/containers/storage:O \
+    -e OLARES_REGISTRY=ghcr.io/myuser \
+    -e OLARES_TAG=pr-123 \
+    olares-test-vm
+
+# Rootful podman (if running as root)
+sudo podman run --rm -it --privileged \
+    --device /dev/kvm \
+    -v ~/olares-test-data:/vm \
+    -v /var/lib/containers/storage:/var/lib/containers/storage:O \
+    ...
+```
+
+**Notes:**
+- `:O` creates an overlay mount (host storage is read-only base)
+- `bootc-image-builder` inside the container will reuse cached images
+- Requires matching storage driver (usually `overlay`)
+
 ### Faster Iteration
 
 For faster iteration during development:

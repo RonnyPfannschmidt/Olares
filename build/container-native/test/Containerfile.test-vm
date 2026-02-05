@@ -19,6 +19,15 @@
 #     -e OLARES_TAG=pr-123 \
 #     olares-test-vm
 #
+#   # Share host podman storage to avoid re-downloading images:
+#   podman run --rm -it --privileged \
+#     --device /dev/kvm \
+#     -v ./vm-data:/vm \
+#     -v ~/.local/share/containers/storage:/var/lib/containers/storage:O \
+#     -e OLARES_REGISTRY=ghcr.io/myuser \
+#     -e OLARES_TAG=pr-123 \
+#     olares-test-vm
+#
 #   # The VM will boot, update to PR images, reboot into Olares
 
 FROM fedora:41
