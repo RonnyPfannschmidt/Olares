@@ -1,0 +1,264 @@
+# Containerfile.test-vm
+#
+# Container that runs an Olares VM for testing.
+# The VM automatically updates itself from the configured registry on every boot.
+#
+# Requirements:
+#   - KVM support on host (/dev/kvm must exist)
+#   - Disk image mounted at /vm/disk.qcow2 (or will be created)
+#
+# Usage:
+#   # Build test container
+#   podman build -t olares-test-vm -f Containerfile.test-vm .
+#
+#   # Run with existing disk
+#   podman run --rm -it --privileged \
+#     --device /dev/kvm \
+#     -v ./vm-data:/vm \
+#     -e OLARES_REGISTRY=ghcr.io/myuser \
+#     -e OLARES_TAG=pr-123 \
+#     olares-test-vm
+#
+#   # The VM will boot, update to PR images, reboot into Olares
+
+FROM fedora:41
+
+LABEL org.opencontainers.image.title="Olares Test VM Runner"
+LABEL org.opencontainers.image.description="Runs Olares in a VM with auto-update on boot"
+
+# Install QEMU and tools
+RUN dnf install -y \
+    qemu-system-x86 \
+    qemu-img \
+    cloud-utils-growpart \
+    podman \
+    curl \
+    jq \
+    && dnf clean all
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# Default registry and tag (override via environment)
+ENV OLARES_REGISTRY=ghcr.io/olares
+ENV OLARES_TAG=latest
+ENV OLARES_IMAGE=os
+
+# VM configuration
+ENV VM_MEMORY=4096
+ENV VM_CPUS=2
+ENV VM_DISK_SIZE=50G
+ENV VM_SSH_PORT=2222
+ENV VM_VNC_PORT=5900
+
+# Disk path (must be mounted from host for persistence)
+ENV VM_DISK=/vm/disk.qcow2
+
+# =============================================================================
+# Scripts
+# =============================================================================
+
+# Main entrypoint script
+COPY <<'ENTRYPOINT' /usr/local/bin/start-vm
+#!/bin/bash
+set -euo pipefail
+
+VM_DISK="${VM_DISK:-/vm/disk.qcow2}"
+VM_MEMORY="${VM_MEMORY:-4096}"
+VM_CPUS="${VM_CPUS:-2}"
+VM_DISK_SIZE="${VM_DISK_SIZE:-50G}"
+VM_SSH_PORT="${VM_SSH_PORT:-2222}"
+VM_VNC_PORT="${VM_VNC_PORT:-5900}"
+
+OLARES_REGISTRY="${OLARES_REGISTRY:-ghcr.io/olares}"
+OLARES_TAG="${OLARES_TAG:-latest}"
+OLARES_IMAGE="${OLARES_IMAGE:-os}"
+
+FULL_IMAGE="${OLARES_REGISTRY}/olares-${OLARES_IMAGE}:${OLARES_TAG}"
+
+log() {
+    echo "[test-vm] $(date -Iseconds) $*"
+}
+
+# Check KVM support
+check_kvm() {
+    if [[ ! -e /dev/kvm ]]; then
+        log "ERROR: /dev/kvm not found. Run with --device /dev/kvm"
+        log "If running on Linux, ensure KVM is available:"
+        log "  - Intel: modprobe kvm_intel"
+        log "  - AMD: modprobe kvm_amd"
+        exit 1
+    fi
+    log "KVM support: OK"
+}
+
+# Create or verify disk image
+setup_disk() {
+    local disk_dir=$(dirname "$VM_DISK")
+    
+    if [[ ! -d "$disk_dir" ]]; then
+        log "ERROR: Disk directory not mounted: $disk_dir"
+        log "Run with: -v /path/to/vm-data:/vm"
+        exit 1
+    fi
+    
+    if [[ ! -f "$VM_DISK" ]]; then
+        log "Creating new disk image: $VM_DISK ($VM_DISK_SIZE)"
+        log "This will be a fresh Olares installation."
+        
+        # Need to build initial image from netinstall
+        create_initial_disk
+    else
+        log "Using existing disk: $VM_DISK"
+        log "VM will update to ${FULL_IMAGE} on boot."
+    fi
+}
+
+# Create initial disk from netinstall image
+create_initial_disk() {
+    local netinstall_image="${OLARES_REGISTRY}/olares-netinstall:${OLARES_TAG}"
+    local temp_dir=$(mktemp -d)
+    
+    log "Building initial disk from netinstall image..."
+    log "Netinstall image: ${netinstall_image}"
+    
+    # Use bootc-image-builder to create initial disk
+    # This runs in a nested container
+    podman run --rm --privileged \
+        --security-opt label=disable \
+        -v "${temp_dir}:/output" \
+        quay.io/centos-bootc/bootc-image-builder:latest \
+        --type qcow2 \
+        --output /output \
+        "${netinstall_image}" || {
+            log "ERROR: Failed to build disk image"
+            log "Make sure the netinstall image exists: ${netinstall_image}"
+            rm -rf "$temp_dir"
+            exit 1
+        }
+    
+    # Move to target location
+    mv "${temp_dir}"/*.qcow2 "$VM_DISK"
+    rm -rf "$temp_dir"
+    
+    # Resize disk to target size
+    log "Resizing disk to ${VM_DISK_SIZE}..."
+    qemu-img resize "$VM_DISK" "$VM_DISK_SIZE"
+    
+    log "Initial disk created: $VM_DISK"
+}
+
+# Write cloud-init config for auto-update
+setup_cloud_init() {
+    local ci_dir="/vm/cidata"
+    mkdir -p "$ci_dir"
+    
+    # Create user-data that triggers update on every boot
+    cat > "${ci_dir}/user-data" << EOF
+#cloud-config
+bootcmd:
+  - echo "Olares Test VM - Checking for updates..."
+  - |
+    if command -v bootc &>/dev/null; then
+      echo "Updating to ${FULL_IMAGE}..."
+      bootc upgrade --image "${FULL_IMAGE}" || true
+    fi
+
+runcmd:
+  - echo "Olares Test VM booted at \$(date)" >> /var/log/olares-test.log
+
+power_state:
+  mode: reboot
+  condition: test -f /run/bootc-pending-update
+EOF
+
+    # Create meta-data
+    cat > "${ci_dir}/meta-data" << EOF
+instance-id: olares-test-vm
+local-hostname: olares-test
+EOF
+
+    # Create cloud-init ISO
+    log "Creating cloud-init ISO..."
+    if command -v genisoimage &>/dev/null; then
+        genisoimage -output /vm/cidata.iso -volid cidata -joliet -rock \
+            "${ci_dir}/user-data" "${ci_dir}/meta-data" 2>/dev/null
+    elif command -v mkisofs &>/dev/null; then
+        mkisofs -output /vm/cidata.iso -volid cidata -joliet -rock \
+            "${ci_dir}/user-data" "${ci_dir}/meta-data" 2>/dev/null
+    else
+        log "WARN: No ISO creation tool found, cloud-init disabled"
+        return
+    fi
+}
+
+# Start QEMU
+start_qemu() {
+    log "Starting QEMU VM..."
+    log "  Memory: ${VM_MEMORY}M"
+    log "  CPUs: ${VM_CPUS}"
+    log "  Disk: ${VM_DISK}"
+    log "  SSH: localhost:${VM_SSH_PORT}"
+    log "  VNC: localhost:${VM_VNC_PORT}"
+    log ""
+    log "Target image: ${FULL_IMAGE}"
+    log ""
+    log "Connect via SSH: ssh -p ${VM_SSH_PORT} root@localhost"
+    log "Connect via VNC: vncviewer localhost:${VM_VNC_PORT}"
+    log ""
+
+    local qemu_args=(
+        -name "olares-test"
+        -machine q35,accel=kvm
+        -cpu host
+        -m "${VM_MEMORY}"
+        -smp "${VM_CPUS}"
+        -drive "file=${VM_DISK},format=qcow2,if=virtio"
+        -netdev "user,id=net0,hostfwd=tcp::${VM_SSH_PORT}-:22,hostfwd=tcp::6443-:6443,hostfwd=tcp::8080-:80,hostfwd=tcp::8443-:443"
+        -device "virtio-net-pci,netdev=net0"
+        -vnc ":$(( VM_VNC_PORT - 5900 ))"
+        -serial stdio
+        -monitor none
+    )
+    
+    # Add cloud-init if available
+    if [[ -f /vm/cidata.iso ]]; then
+        qemu_args+=(-cdrom /vm/cidata.iso)
+    fi
+    
+    # Enable UEFI boot
+    if [[ -f /usr/share/edk2/ovmf/OVMF_CODE.fd ]]; then
+        qemu_args+=(
+            -drive "if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd"
+        )
+    fi
+    
+    exec qemu-system-x86_64 "${qemu_args[@]}"
+}
+
+main() {
+    log "============================================"
+    log "Olares Test VM Runner"
+    log "============================================"
+    log ""
+    
+    check_kvm
+    setup_disk
+    setup_cloud_init
+    start_qemu
+}
+
+main "$@"
+ENTRYPOINT
+
+RUN chmod +x /usr/local/bin/start-vm
+
+# Volume for VM disk (must be mounted)
+VOLUME /vm
+
+# Expose ports
+EXPOSE 2222 5900 6443 8080 8443
+
+# Default command
+ENTRYPOINT ["/usr/local/bin/start-vm"]

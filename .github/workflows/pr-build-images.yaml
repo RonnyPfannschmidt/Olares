@@ -282,10 +282,89 @@ jobs:
             olares.pr.number=${{ env.PR_NUMBER }}
 
   # ==========================================================================
+  # Build self-updating test OS image
+  # This image auto-updates from the PR registry on every boot
+  # ==========================================================================
+  build-test-os:
+    needs: [prepare, build-images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push test-os
+        uses: docker/build-push-action@v5
+        with:
+          context: build/container-native/test
+          file: build/container-native/test/Containerfile.test-os
+          build-args: |
+            BASE_IMAGE=${{ needs.prepare.outputs.registry }}/olares-os:${{ needs.prepare.outputs.tag }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ needs.prepare.outputs.registry }}/olares-test-os:${{ needs.prepare.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            olares.pr.number=${{ env.PR_NUMBER }}
+            olares.test.auto-update=enabled
+
+  # ==========================================================================
+  # Build test VM runner container
+  # ==========================================================================
+  build-test-vm:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push test-vm
+        uses: docker/build-push-action@v5
+        with:
+          context: build/container-native/test
+          file: build/container-native/test/Containerfile.test-vm
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ needs.prepare.outputs.registry }}/olares-test-vm:${{ needs.prepare.outputs.tag }}
+            ${{ needs.prepare.outputs.registry }}/olares-test-vm:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            olares.pr.number=${{ env.PR_NUMBER }}
+
+  # ==========================================================================
   # Generate VM artifacts (optional, on-demand)
   # ==========================================================================
   build-vm:
-    needs: [prepare, build-images]
+    needs: [prepare, build-test-os]
     if: contains(github.event.pull_request.labels.*.name, 'build-vm')
     runs-on: ubuntu-latest
     permissions:
@@ -297,10 +376,11 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Build QCOW2
+      - name: Build QCOW2 from test-os (auto-updating)
         run: |
           mkdir -p output
           
+          # Build from test-os which has auto-update enabled
           sudo podman run --rm --privileged \
             --security-opt label=type:unconfined_t \
             -v $(pwd)/output:/output \
@@ -308,12 +388,12 @@ jobs:
             quay.io/centos-bootc/bootc-image-builder:latest \
             --type qcow2 \
             --output /output \
-            ${{ needs.prepare.outputs.registry }}/olares-os:${{ needs.prepare.outputs.tag }}
+            ${{ needs.prepare.outputs.registry }}/olares-test-os:${{ needs.prepare.outputs.tag }}
 
       - name: Upload QCOW2
         uses: actions/upload-artifact@v4
         with:
-          name: olares-os-pr-${{ env.PR_NUMBER }}.qcow2
+          name: olares-test-os-pr-${{ env.PR_NUMBER }}.qcow2
           path: output/*.qcow2
           retention-days: 3
 
@@ -321,7 +401,7 @@ jobs:
   # Post summary comment on PR
   # ==========================================================================
   summary:
-    needs: [prepare, build-images, build-netinstall]
+    needs: [prepare, build-images, build-netinstall, build-test-os, build-test-vm]
     if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -335,48 +415,61 @@ jobs:
             const registry = '${{ needs.prepare.outputs.registry }}';
             const tag = '${{ needs.prepare.outputs.tag }}';
             const sha = '${{ github.sha }}'.substring(0, 7);
+            const prNumber = '${{ env.PR_NUMBER }}';
             
             const body = `## 🐳 Container Images Built
             
             All images from this PR are available in the container registry:
             
-            | Image | Tag |
-            |-------|-----|
-            | \`${registry}/olares-os\` | \`${tag}\` |
-            | \`${registry}/olares-installer\` | \`${tag}\` |
-            | \`${registry}/olares-netinstall\` | \`${tag}\` |
-            | \`${registry}/olares-app-service\` | \`${tag}\` |
-            | \`${registry}/olares-bfl\` | \`${tag}\` |
-            | ... | ... |
+            | Image | Description |
+            |-------|-------------|
+            | \`${registry}/olares-os:${tag}\` | Full Olares OS |
+            | \`${registry}/olares-test-os:${tag}\` | **Auto-updating** OS (updates on every boot) |
+            | \`${registry}/olares-netinstall:${tag}\` | Minimal installer (rebases on first boot) |
+            | \`${registry}/olares-test-vm:${tag}\` | Test VM runner container |
+            | \`${registry}/olares-installer:${tag}\` | Containerized installer |
             
-            ### Quick Test
+            ### 🔄 Auto-Updating Test VM (Recommended)
             
-            \`\`\`bash
-            # Pull the OS image
-            podman pull ${registry}/olares-os:${tag}
-            
-            # Or use netinstall for VM testing
-            podman pull ${registry}/olares-netinstall:${tag}
-            \`\`\`
-            
-            ### Create Test VM
+            Use the test-os image for continuous testing. It updates automatically on every boot:
             
             \`\`\`bash
-            # Build QCOW2 from OS image
+            # Create test VM with auto-update
             sudo podman run --rm --privileged \\
               -v ./output:/output \\
               quay.io/centos-bootc/bootc-image-builder:latest \\
               --type qcow2 \\
-              ${registry}/olares-os:${tag}
+              ${registry}/olares-test-os:${tag}
             
-            # Start VM with libvirt/QEMU
-            virt-install --name olares-pr-${{ env.PR_NUMBER }} \\
-              --memory 4096 --vcpus 2 \\
-              --disk ./output/image.qcow2 \\
-              --import --os-variant centos-stream9
+            # Boot VM - it will auto-update when new images are pushed!
+            qemu-system-x86_64 -enable-kvm -m 4096 -cpu host \\
+              -drive file=./output/qcow2/disk.qcow2,format=qcow2 \\
+              -nic user,hostfwd=tcp::2222-:22
             \`\`\`
             
-            > 💡 Add the \`build-vm\` label to automatically generate a QCOW2 artifact.
+            ### 🖥️ Test VM Container (With KVM)
+            
+            Run the full test environment in a container:
+            
+            \`\`\`bash
+            mkdir -p ~/olares-pr-${prNumber}
+            
+            podman run --rm -it --privileged \\
+              --device /dev/kvm \\
+              -v ~/olares-pr-${prNumber}:/vm \\
+              -e OLARES_REGISTRY=${registry} \\
+              -e OLARES_TAG=${tag} \\
+              -p 2222:2222 -p 5900:5900 \\
+              ${registry}/olares-test-vm:${tag}
+            \`\`\`
+            
+            ### 📝 Testing Workflow
+            
+            1. Push commits → Images rebuild with same tag
+            2. Reboot VM → Auto-updates to latest images
+            3. Test → Repeat
+            
+            > 💡 Add the \`build-vm\` label to auto-generate a ready-to-use QCOW2 artifact.
             
             <sub>Built from commit ${sha}</sub>`;
             

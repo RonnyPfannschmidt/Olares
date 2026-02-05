@@ -1,0 +1,176 @@
+# Containerfile.test-os
+#
+# Self-updating Olares OS image for testing.
+# On every boot, this image checks for updates and rebases if available.
+#
+# This is built FROM the main Olares OS image, adding auto-update capability.
+#
+# Build:
+#   podman build \
+#     --build-arg BASE_IMAGE=ghcr.io/myuser/olares-os:pr-123 \
+#     -t olares-test-os:pr-123 \
+#     -f Containerfile.test-os .
+#
+# The resulting image will:
+#   1. Boot into Olares
+#   2. On every boot, check BASE_IMAGE for updates
+#   3. If update available, apply and reboot
+#   4. Continue into Olares
+
+ARG BASE_IMAGE=ghcr.io/olares/olares-os:latest
+FROM ${BASE_IMAGE}
+
+# Store the source image for update checks
+ARG BASE_IMAGE
+LABEL olares.test.source-image="${BASE_IMAGE}"
+
+# =============================================================================
+# Auto-Update Service
+# This runs on every boot and updates to the latest version of BASE_IMAGE
+# =============================================================================
+
+COPY <<'SERVICE' /usr/lib/systemd/system/olares-auto-update.service
+[Unit]
+Description=Olares Auto-Update Check
+Documentation=https://github.com/beclab/Olares
+After=network-online.target
+Wants=network-online.target
+Before=k3s.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/olares-auto-update
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+COPY <<'SCRIPT' /usr/local/bin/olares-auto-update
+#!/bin/bash
+#
+# Auto-update script for Olares test images
+# Runs on every boot and checks for updates to the source image
+#
+set -euo pipefail
+
+LOG_FILE="/var/log/olares-auto-update.log"
+MARKER_FILE="/run/olares-update-checked"
+
+log() {
+    local msg="[$(date -Iseconds)] $*"
+    echo "$msg" | tee -a "$LOG_FILE"
+}
+
+# Get source image from container labels
+get_source_image() {
+    # Try to read from label stored during build
+    local label_file="/etc/olares/test-source-image"
+    if [[ -f "$label_file" ]]; then
+        cat "$label_file"
+    else
+        # Fallback: try to get from current bootc status
+        bootc status --json 2>/dev/null | jq -r '.status.booted.image.image // empty' || true
+    fi
+}
+
+main() {
+    log "============================================"
+    log "Olares Auto-Update Check"
+    log "============================================"
+    
+    # Skip if already checked this boot
+    if [[ -f "$MARKER_FILE" ]]; then
+        log "Already checked for updates this boot, skipping"
+        exit 0
+    fi
+    
+    # Get source image
+    local source_image=$(get_source_image)
+    if [[ -z "$source_image" ]]; then
+        log "WARN: Could not determine source image, skipping update check"
+        touch "$MARKER_FILE"
+        exit 0
+    fi
+    
+    log "Source image: ${source_image}"
+    
+    # Wait for network
+    log "Waiting for network..."
+    for i in {1..30}; do
+        if ping -c1 -W1 ghcr.io &>/dev/null || curl -sf --max-time 5 https://ghcr.io &>/dev/null; then
+            log "Network available"
+            break
+        fi
+        sleep 2
+    done
+    
+    # Check for updates
+    log "Checking for updates..."
+    
+    if bootc upgrade --check 2>&1 | tee -a "$LOG_FILE"; then
+        log "Update available, applying..."
+        
+        if bootc upgrade 2>&1 | tee -a "$LOG_FILE"; then
+            log "Update applied successfully"
+            log "System will reboot to apply changes..."
+            touch "$MARKER_FILE"
+            
+            # Schedule reboot
+            sleep 5
+            systemctl reboot
+        else
+            log "ERROR: Update failed"
+        fi
+    else
+        log "No updates available or already up to date"
+    fi
+    
+    touch "$MARKER_FILE"
+    log "Update check complete"
+}
+
+main "$@"
+SCRIPT
+
+RUN chmod +x /usr/local/bin/olares-auto-update
+
+# Store the source image for runtime reference
+ARG BASE_IMAGE
+RUN mkdir -p /etc/olares && echo "${BASE_IMAGE}" > /etc/olares/test-source-image
+
+# Enable auto-update service
+RUN systemctl enable olares-auto-update.service
+
+# =============================================================================
+# Test Helpers
+# =============================================================================
+
+# Script to show current version and update status
+COPY <<'STATUS' /usr/local/bin/olares-test-status
+#!/bin/bash
+echo "Olares Test OS Status"
+echo "====================="
+echo ""
+echo "Source image:"
+cat /etc/olares/test-source-image 2>/dev/null || echo "  (unknown)"
+echo ""
+echo "Bootc status:"
+bootc status 2>/dev/null || echo "  (bootc not available)"
+echo ""
+echo "Last update check:"
+if [[ -f /var/log/olares-auto-update.log ]]; then
+    tail -20 /var/log/olares-auto-update.log
+else
+    echo "  (no update log)"
+fi
+STATUS
+
+RUN chmod +x /usr/local/bin/olares-test-status
+
+# Label indicating this is a test image
+LABEL olares.test="true"
+LABEL olares.test.auto-update="enabled"
