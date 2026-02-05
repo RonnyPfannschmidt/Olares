@@ -428,29 +428,18 @@ jobs:
             | \`${registry}/olares-test-os:${tag}\` | **Auto-updating** OS (updates on every boot) |
             | \`${registry}/olares-netinstall:${tag}\` | Minimal installer (rebases on first boot) |
             | \`${registry}/olares-test-vm:${tag}\` | Test VM runner container |
-            | \`${registry}/olares-installer:${tag}\` | Containerized installer |
             
-            ### 🔄 Auto-Updating Test VM (Recommended)
+            ### 🚀 Quick Start (Recommended)
             
-            Use the test-os image for continuous testing. It updates automatically on every boot:
+            From the Olares repo, run:
             
             \`\`\`bash
-            # Create test VM with auto-update
-            sudo podman run --rm --privileged \\
-              -v ./output:/output \\
-              quay.io/centos-bootc/bootc-image-builder:latest \\
-              --type qcow2 \\
-              ${registry}/olares-test-os:${tag}
-            
-            # Boot VM - it will auto-update when new images are pushed!
-            qemu-system-x86_64 -enable-kvm -m 4096 -cpu host \\
-              -drive file=./output/qcow2/disk.qcow2,format=qcow2 \\
-              -nic user,hostfwd=tcp::2222-:22
+            ./build/run-test-from-pr.py
             \`\`\`
             
-            ### 🖥️ Test VM Container (With KVM)
+            This auto-detects the current branch, finds the PR, and starts the test VM.
             
-            Run the full test environment in a container:
+            ### 🖥️ Manual Test VM
             
             \`\`\`bash
             mkdir -p ~/olares-pr-${prNumber}
@@ -460,9 +449,18 @@ jobs:
               -v ~/olares-pr-${prNumber}:/vm \\
               -e OLARES_REGISTRY=${registry} \\
               -e OLARES_TAG=${tag} \\
-              -p 2222:2222 -p 5900:5900 \\
+              -p 5900:5900 \\
               ${registry}/olares-test-vm:${tag}
             \`\`\`
+            
+            **First boot:**
+            1. Downloads Fedora cloud image (cached for future runs)
+            2. Installs bootc, switches to Olares OS
+            3. Reboots into Olares
+            
+            **Subsequent boots:**
+            - Auto-updates to latest PR images
+            - Root password: \`olares\`
             
             ### 📝 Testing Workflow
             
@@ -470,7 +468,7 @@ jobs:
             2. Reboot VM → Auto-updates to latest images
             3. Test → Repeat
             
-            > 💡 Add the \`build-vm\` label to auto-generate a ready-to-use QCOW2 artifact.
+            > 💡 Add the \`build-vm\` label to generate a pre-built QCOW2 artifact.
             
             <sub>Built from commit ${sha}</sub>`;
             

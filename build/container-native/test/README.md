@@ -40,18 +40,23 @@ podman run --rm -it --privileged \
 ### First Run
 
 On first run (no disk image):
-1. Downloads netinstall image from registry
-2. Builds QCOW2 disk image
-3. Boots VM
-4. VM rebases to full Olares OS and reboots
+1. Downloads Fedora cloud image (cached in `/vm/cloud-base.qcow2`)
+2. Creates VM disk from cloud image
+3. Boots VM with cloud-init
+4. Cloud-init installs `bootc` and switches to Olares OS
+5. VM reboots into Olares
 
 ### Subsequent Runs
 
 On each boot:
 1. Boots existing disk
-2. Cloud-init checks for updates
-3. If update available, applies and reboots
+2. Cloud-init checks for updates via `bootc upgrade`
+3. If update available, stages and reboots
 4. Continues into Olares
+
+### Default Credentials
+
+- **Root password**: `olares` (for debugging via VNC/console)
 
 ### Connect
 

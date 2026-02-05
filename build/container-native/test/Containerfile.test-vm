@@ -49,6 +49,8 @@ RUN dnf install -y \
     iproute \
     iptables-nft \
     dnsmasq \
+    # For cloud-init ISO
+    genisoimage \
     && dnf clean all
 
 # =============================================================================
@@ -77,6 +79,9 @@ ENV VM_SHARE_STORAGE=true
 
 # Network mode: "user" (port forwarding) or "tap" (bridged, VM gets own IP)
 ENV VM_NETWORK_MODE=tap
+
+# Cloud image URL for initial disk (cached in /vm/cloud-base.qcow2)
+ENV VM_CLOUD_IMAGE_URL=https://download.fedoraproject.org/pub/fedora/linux/releases/41/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-41-1.4.x86_64.qcow2
 # For TAP mode: VM network configuration
 ENV VM_BRIDGE_IP=192.168.100.1
 ENV VM_BRIDGE_SUBNET=192.168.100.0/24
@@ -214,62 +219,124 @@ setup_disk() {
     fi
 }
 
-# Create initial disk from netinstall image
+# Create initial disk from a cloud image
+# This uses a generic Fedora/CentOS cloud image and cloud-init to bootc switch
 create_initial_disk() {
-    local netinstall_image="${OLARES_REGISTRY}/olares-netinstall:${OLARES_TAG}"
-    local temp_dir=$(mktemp -d)
+    local cloud_image_url="${VM_CLOUD_IMAGE_URL:-https://download.fedoraproject.org/pub/fedora/linux/releases/41/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-41-1.4.x86_64.qcow2}"
+    local cloud_image="/vm/cloud-base.qcow2"
     
-    log "Building initial disk from netinstall image..."
-    log "Netinstall image: ${netinstall_image}"
+    log "Creating initial disk from cloud image..."
     
-    # Use bootc-image-builder to create initial disk
-    # This runs in a nested container
-    podman run --rm --privileged \
-        --security-opt label=disable \
-        -v "${temp_dir}:/output" \
-        quay.io/centos-bootc/bootc-image-builder:latest \
-        --type qcow2 \
-        --output /output \
-        "${netinstall_image}" || {
-            log "ERROR: Failed to build disk image"
-            log "Make sure the netinstall image exists: ${netinstall_image}"
-            rm -rf "$temp_dir"
+    # Download cloud image if not cached
+    if [[ ! -f "$cloud_image" ]]; then
+        log "Downloading cloud image..."
+        log "URL: ${cloud_image_url}"
+        curl -fSL -o "$cloud_image" "$cloud_image_url" || {
+            log "ERROR: Failed to download cloud image"
             exit 1
         }
+        log "Cloud image downloaded: $(du -h "$cloud_image" | cut -f1)"
+    else
+        log "Using cached cloud image: $cloud_image"
+    fi
     
-    # Move to target location
-    mv "${temp_dir}"/*.qcow2 "$VM_DISK"
-    rm -rf "$temp_dir"
+    # Create disk from cloud image
+    log "Creating VM disk from cloud image..."
+    cp "$cloud_image" "$VM_DISK"
     
     # Resize disk to target size
     log "Resizing disk to ${VM_DISK_SIZE}..."
     qemu-img resize "$VM_DISK" "$VM_DISK_SIZE"
     
     log "Initial disk created: $VM_DISK"
+    log ""
+    log "On first boot, cloud-init will:"
+    log "  1. Install bootc"
+    log "  2. Switch to ${FULL_IMAGE}"
+    log "  3. Reboot into Olares"
 }
 
-# Write cloud-init config for auto-update
+# Write cloud-init config for bootstrapping and auto-update
 setup_cloud_init() {
     local ci_dir="/vm/cidata"
     mkdir -p "$ci_dir"
     
-    # Create user-data that triggers update on every boot
+    # Marker file to track if we've done initial switch
+    local switch_marker="/var/lib/olares-switched"
+    
+    # Create user-data that handles both initial switch and updates
     cat > "${ci_dir}/user-data" << EOF
 #cloud-config
-bootcmd:
-  - echo "Olares Test VM - Checking for updates..."
+# Olares Test VM Cloud-Init Configuration
+# Handles: initial bootc switch OR subsequent updates
+
+# Set password for root (for debugging)
+chpasswd:
+  list: |
+    root:olares
+  expire: false
+
+ssh_pwauth: true
+
+# Enable root SSH login
+runcmd:
+  - sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+  - systemctl restart sshd
   - |
+    set -x
+    SWITCH_MARKER="${switch_marker}"
+    TARGET_IMAGE="${FULL_IMAGE}"
+    
+    echo "=== Olares Test VM Bootstrap ===" | tee -a /var/log/olares-bootstrap.log
+    date | tee -a /var/log/olares-bootstrap.log
+    
     if command -v bootc &>/dev/null; then
-      echo "Updating to ${FULL_IMAGE}..."
-      bootc upgrade --image "${FULL_IMAGE}" || true
+      echo "bootc is available" | tee -a /var/log/olares-bootstrap.log
+      
+      if [[ -f "\$SWITCH_MARKER" ]]; then
+        # Already switched - just check for updates
+        echo "Checking for updates to \$TARGET_IMAGE..." | tee -a /var/log/olares-bootstrap.log
+        if bootc upgrade 2>&1 | tee -a /var/log/olares-bootstrap.log; then
+          if bootc status | grep -q "staged"; then
+            echo "Update staged, rebooting..." | tee -a /var/log/olares-bootstrap.log
+            touch /run/reboot-required
+          fi
+        fi
+      else
+        # First boot - do the switch
+        echo "First boot: switching to \$TARGET_IMAGE..." | tee -a /var/log/olares-bootstrap.log
+        if bootc switch --retain "\$TARGET_IMAGE" 2>&1 | tee -a /var/log/olares-bootstrap.log; then
+          touch "\$SWITCH_MARKER"
+          echo "Switch successful, rebooting..." | tee -a /var/log/olares-bootstrap.log
+          touch /run/reboot-required
+        else
+          echo "ERROR: bootc switch failed" | tee -a /var/log/olares-bootstrap.log
+        fi
+      fi
+    else
+      # No bootc yet - install it (Fedora cloud image)
+      echo "Installing bootc..." | tee -a /var/log/olares-bootstrap.log
+      dnf install -y bootc 2>&1 | tee -a /var/log/olares-bootstrap.log || true
+      
+      if command -v bootc &>/dev/null; then
+        echo "bootc installed, switching to \$TARGET_IMAGE..." | tee -a /var/log/olares-bootstrap.log
+        if bootc switch --retain "\$TARGET_IMAGE" 2>&1 | tee -a /var/log/olares-bootstrap.log; then
+          touch "\$SWITCH_MARKER"
+          echo "Switch successful, rebooting..." | tee -a /var/log/olares-bootstrap.log
+          touch /run/reboot-required
+        else
+          echo "ERROR: bootc switch failed" | tee -a /var/log/olares-bootstrap.log
+        fi
+      else
+        echo "ERROR: Failed to install bootc" | tee -a /var/log/olares-bootstrap.log
+      fi
     fi
 
-runcmd:
-  - echo "Olares Test VM booted at \$(date)" >> /var/log/olares-test.log
-
+# Reboot if needed
 power_state:
+  delay: "+1"
   mode: reboot
-  condition: test -f /run/bootc-pending-update
+  condition: test -f /run/reboot-required
 EOF
 
     # Create meta-data
@@ -290,6 +357,11 @@ EOF
         log "WARN: No ISO creation tool found, cloud-init disabled"
         return
     fi
+    
+    log "Cloud-init configured:"
+    log "  - Root password: olares"
+    log "  - First boot: install bootc, switch to ${FULL_IMAGE}"
+    log "  - Subsequent boots: check for updates"
 }
 
 # Start QEMU
