@@ -129,7 +129,7 @@ $ cat bin/kubectl
 #!/bin/bash
 exec podman run --rm -i -t --net=host \
     -v $HOME/.kube/config:/root/.kube/config:ro \
-    bitnami/kubectl:1.33.3 kubectl "$@"
+    bitnami/kubectl:1.32.3 kubectl "$@"
 ```
 
 This provides:
@@ -175,11 +175,11 @@ target: prebuilt
 output:
   binaries:
     - id: kubectl
-      name: kubectl-v1.33.3,pkg/kube/v1.33.3
+      name: kubectl-v1.32.3,pkg/kube/v1.32.3
       amd64: https://dl.k8s.io/.../kubectl
       arm64: https://dl.k8s.io/.../kubectl
   containers:
-    - name: registry.k8s.io/kube-apiserver:v1.33.3
+    - name: registry.k8s.io/kube-apiserver:v1.32.3
 ```
 
 ### New `dependencies.yaml`
@@ -188,7 +188,7 @@ spec:
   bootstrap:
     # Only 2 binaries needed!
     - id: k3s
-      version: "1.33.3+k3s1"
+      version: "1.32.3+k3s1"
       description: "Includes containerd, kubelet, kubectl"
       artifacts:
         linux/amd64:

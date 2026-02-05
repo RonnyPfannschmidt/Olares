@@ -31,7 +31,7 @@ RUN apk add --no-cache \
 # Stage: Collect CLI tools from their official images
 # ============================================================================
 
-FROM bitnami/kubectl:1.33.3 AS kubectl
+FROM bitnami/kubectl:1.32.3 AS kubectl
 FROM alpine/helm:3.17.1 AS helm
 
 # ============================================================================

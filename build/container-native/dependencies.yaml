@@ -85,19 +85,19 @@ spec:
     # -------------------------------------------------------------------------
     # Kubernetes Control Plane
     # -------------------------------------------------------------------------
-    - image: registry.k8s.io/kube-apiserver:v1.33.3
+    - image: registry.k8s.io/kube-apiserver:v1.32.3
       description: "Kubernetes API server"
       required: true
 
-    - image: registry.k8s.io/kube-controller-manager:v1.33.3
+    - image: registry.k8s.io/kube-controller-manager:v1.32.3
       description: "Kubernetes controller manager"
       required: true
 
-    - image: registry.k8s.io/kube-scheduler:v1.33.3
+    - image: registry.k8s.io/kube-scheduler:v1.32.3
       description: "Kubernetes scheduler"
       required: true
 
-    - image: registry.k8s.io/kube-proxy:v1.33.3
+    - image: registry.k8s.io/kube-proxy:v1.32.3
       description: "Kubernetes network proxy"
       required: true
 
@@ -135,7 +135,7 @@ spec:
     # NOTE: k3s provides kubectl/crictl via symlinks on the host, but these
     # container images are useful for the installer and containerized workflows
     # -------------------------------------------------------------------------
-    - image: bitnami/kubectl:1.33.3
+    - image: bitnami/kubectl:1.32.3
       description: "Kubernetes CLI (for installer container)"
       alias: kubectl
 
