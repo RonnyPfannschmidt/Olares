@@ -35,7 +35,7 @@ FROM fedora:41
 LABEL org.opencontainers.image.title="Olares Test VM Runner"
 LABEL org.opencontainers.image.description="Runs Olares in a VM with auto-update on boot"
 
-# Install QEMU, virtiofsd, and tools
+# Install QEMU, virtiofsd, networking tools
 RUN dnf install -y \
     qemu-system-x86 \
     qemu-img \
@@ -45,6 +45,10 @@ RUN dnf install -y \
     skopeo \
     curl \
     jq \
+    # For TAP networking
+    iproute \
+    iptables-nft \
+    dnsmasq \
     && dnf clean all
 
 # =============================================================================
@@ -71,6 +75,16 @@ ENV VM_DISK=/vm/disk.qcow2
 # Requires: -v ~/.local/share/containers/storage:/var/lib/containers/storage:O
 ENV VM_SHARE_STORAGE=true
 
+# Network mode: "user" (port forwarding) or "tap" (bridged, VM gets own IP)
+ENV VM_NETWORK_MODE=tap
+# For TAP mode: VM network configuration
+ENV VM_BRIDGE_IP=192.168.100.1
+ENV VM_BRIDGE_SUBNET=192.168.100.0/24
+ENV VM_DHCP_START=192.168.100.10
+ENV VM_DHCP_END=192.168.100.50
+# VM hostname (used by DHCP/DNS)
+ENV VM_HOSTNAME=olares-test
+
 # =============================================================================
 # Scripts
 # =============================================================================
@@ -87,11 +101,22 @@ VM_DISK_SIZE="${VM_DISK_SIZE:-50G}"
 VM_SSH_PORT="${VM_SSH_PORT:-2222}"
 VM_VNC_PORT="${VM_VNC_PORT:-5900}"
 
+# Network configuration
+VM_NETWORK_MODE="${VM_NETWORK_MODE:-tap}"
+VM_BRIDGE_IP="${VM_BRIDGE_IP:-192.168.100.1}"
+VM_BRIDGE_SUBNET="${VM_BRIDGE_SUBNET:-192.168.100.0/24}"
+VM_DHCP_START="${VM_DHCP_START:-192.168.100.10}"
+VM_DHCP_END="${VM_DHCP_END:-192.168.100.50}"
+VM_HOSTNAME="${VM_HOSTNAME:-olares-test}"
+
 OLARES_REGISTRY="${OLARES_REGISTRY:-ghcr.io/olares}"
 OLARES_TAG="${OLARES_TAG:-latest}"
 OLARES_IMAGE="${OLARES_IMAGE:-os}"
 
 FULL_IMAGE="${OLARES_REGISTRY}/olares-${OLARES_IMAGE}:${OLARES_TAG}"
+
+# Will be set by setup_network
+VM_IP=""
 
 log() {
     echo "[test-vm] $(date -Iseconds) $*"
@@ -107,6 +132,64 @@ check_kvm() {
         exit 1
     fi
     log "KVM support: OK"
+}
+
+# Setup TAP networking with bridge and DHCP
+setup_network() {
+    if [[ "$VM_NETWORK_MODE" != "tap" ]]; then
+        log "Network mode: user (port forwarding)"
+        return 0
+    fi
+    
+    log "Setting up TAP networking..."
+    
+    # Create bridge
+    if ! ip link show br0 &>/dev/null; then
+        ip link add br0 type bridge
+        ip addr add "${VM_BRIDGE_IP}/24" dev br0
+        ip link set br0 up
+        log "Created bridge br0 with IP ${VM_BRIDGE_IP}"
+    fi
+    
+    # Create TAP device for VM
+    if ! ip link show tap0 &>/dev/null; then
+        ip tuntap add tap0 mode tap
+        ip link set tap0 master br0
+        ip link set tap0 up
+        log "Created TAP device tap0"
+    fi
+    
+    # Enable IP forwarding
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    
+    # Setup NAT for outbound traffic
+    iptables -t nat -A POSTROUTING -s "${VM_BRIDGE_SUBNET}" ! -d "${VM_BRIDGE_SUBNET}" -j MASQUERADE
+    iptables -A FORWARD -i br0 -j ACCEPT
+    iptables -A FORWARD -o br0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+    
+    # Start dnsmasq for DHCP and DNS
+    mkdir -p /var/run/dnsmasq
+    cat > /var/run/dnsmasq/dnsmasq.conf << EOF
+interface=br0
+bind-interfaces
+dhcp-range=${VM_DHCP_START},${VM_DHCP_END},12h
+dhcp-option=option:router,${VM_BRIDGE_IP}
+dhcp-option=option:dns-server,${VM_BRIDGE_IP}
+dhcp-host=*,${VM_HOSTNAME},${VM_DHCP_START}
+address=/${VM_HOSTNAME}/${VM_DHCP_START}
+log-queries
+log-dhcp
+EOF
+    
+    dnsmasq -C /var/run/dnsmasq/dnsmasq.conf --pid-file=/var/run/dnsmasq/dnsmasq.pid
+    log "Started dnsmasq (DHCP: ${VM_DHCP_START}-${VM_DHCP_END})"
+    
+    # Set expected VM IP
+    VM_IP="${VM_DHCP_START}"
+    
+    log "Network mode: tap (VM will get IP ${VM_IP})"
+    log "  VM hostname: ${VM_HOSTNAME}"
+    log "  Access: ssh root@${VM_HOSTNAME} or ssh root@${VM_IP}"
 }
 
 # Create or verify disk image
@@ -191,8 +274,8 @@ EOF
 
     # Create meta-data
     cat > "${ci_dir}/meta-data" << EOF
-instance-id: olares-test-vm
-local-hostname: olares-test
+instance-id: ${VM_HOSTNAME}
+local-hostname: ${VM_HOSTNAME}
 EOF
 
     # Create cloud-init ISO
@@ -215,13 +298,8 @@ start_qemu() {
     log "  Memory: ${VM_MEMORY}M"
     log "  CPUs: ${VM_CPUS}"
     log "  Disk: ${VM_DISK}"
-    log "  SSH: localhost:${VM_SSH_PORT}"
-    log "  VNC: localhost:${VM_VNC_PORT}"
     log ""
     log "Target image: ${FULL_IMAGE}"
-    log ""
-    log "Connect via SSH: ssh -p ${VM_SSH_PORT} root@localhost"
-    log "Connect via VNC: vncviewer localhost:${VM_VNC_PORT}"
     log ""
 
     local qemu_args=(
@@ -231,12 +309,29 @@ start_qemu() {
         -m "${VM_MEMORY}"
         -smp "${VM_CPUS}"
         -drive "file=${VM_DISK},format=qcow2,if=virtio"
-        -netdev "user,id=net0,hostfwd=tcp::${VM_SSH_PORT}-:22,hostfwd=tcp::6443-:6443,hostfwd=tcp::8080-:80,hostfwd=tcp::8443-:443"
-        -device "virtio-net-pci,netdev=net0"
         -vnc ":$(( VM_VNC_PORT - 5900 ))"
         -serial stdio
         -monitor none
     )
+    
+    # Network configuration based on mode
+    if [[ "$VM_NETWORK_MODE" == "tap" ]]; then
+        qemu_args+=(
+            -netdev "tap,id=net0,ifname=tap0,script=no,downscript=no"
+            -device "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56"
+        )
+        log "Network: TAP (VM IP: ${VM_IP}, hostname: ${VM_HOSTNAME})"
+        log "Connect via SSH: ssh root@${VM_HOSTNAME}  (or ssh root@${VM_IP})"
+    else
+        qemu_args+=(
+            -netdev "user,id=net0,hostfwd=tcp::${VM_SSH_PORT}-:22,hostfwd=tcp::6443-:6443,hostfwd=tcp::8080-:80,hostfwd=tcp::8443-:443"
+            -device "virtio-net-pci,netdev=net0"
+        )
+        log "Network: User mode (port forwarding)"
+        log "Connect via SSH: ssh -p ${VM_SSH_PORT} root@localhost"
+    fi
+    log "Connect via VNC: vncviewer localhost:${VM_VNC_PORT}"
+    log ""
     
     # Add cloud-init if available
     if [[ -f /vm/cidata.iso ]]; then
@@ -260,6 +355,7 @@ main() {
     log ""
     
     check_kvm
+    setup_network
     setup_disk
     setup_cloud_init
     start_qemu
