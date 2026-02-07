@@ -72,10 +72,11 @@ RUN dnf install -y \
 # Flow: k3s kubelet → cri-dockerd → podman.socket → podman → containers
 # =============================================================================
 
-# Download and install cri-dockerd
+# Download and install cri-dockerd (multi-arch)
 ARG CRI_DOCKERD_VERSION=0.3.16
+ARG TARGETARCH
 RUN curl -fsSL -o /tmp/cri-dockerd.tgz \
-    "https://github.com/Mirantis/cri-dockerd/releases/download/v${CRI_DOCKERD_VERSION}/cri-dockerd-${CRI_DOCKERD_VERSION}.amd64.tgz" \
+    "https://github.com/Mirantis/cri-dockerd/releases/download/v${CRI_DOCKERD_VERSION}/cri-dockerd-${CRI_DOCKERD_VERSION}.${TARGETARCH:-amd64}.tgz" \
     && tar -xzf /tmp/cri-dockerd.tgz -C /tmp \
     && mv /tmp/cri-dockerd/cri-dockerd /usr/local/bin/ \
     && chmod +x /usr/local/bin/cri-dockerd \
@@ -130,10 +131,12 @@ RUN systemctl enable podman.socket \
 # since podman and the host use the same containers/storage format.
 # =============================================================================
 
-# Download k3s binary
+# Download k3s binary (multi-arch: "k3s" for amd64, "k3s-arm64" for arm64)
 ARG K3S_VERSION=v1.32.3+k3s1
-RUN curl -fsSL -o /usr/local/bin/k3s \
-    "https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/k3s" \
+RUN K3S_SUFFIX="" && \
+    if [ "$(uname -m)" = "aarch64" ]; then K3S_SUFFIX="-arm64"; fi && \
+    curl -fsSL -o /usr/local/bin/k3s \
+    "https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/k3s${K3S_SUFFIX}" \
     && chmod +x /usr/local/bin/k3s \
     && ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl \
     && ln -sf /usr/local/bin/k3s /usr/local/bin/crictl \
