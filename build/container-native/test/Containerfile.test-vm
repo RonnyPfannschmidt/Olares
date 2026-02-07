@@ -30,14 +30,12 @@ FROM fedora:41
 LABEL org.opencontainers.image.title="Olares Test VM Runner"
 LABEL org.opencontainers.image.description="Runs Olares in a VM with auto-update on boot"
 
-# Install QEMU, virtiofsd, networking tools
-RUN dnf install -y \
-    qemu-system-x86 \
+# Install QEMU and networking tools (keep minimal to reduce image size)
+# NOTE: podman/skopeo are NOT needed here - this container only runs QEMU.
+# The guest OS handles its own container runtime.
+RUN dnf install -y --setopt=install_weak_deps=False \
+    qemu-system-x86-core \
     qemu-img \
-    virtiofsd \
-    cloud-utils-growpart \
-    podman \
-    skopeo \
     curl \
     jq \
     # For TAP networking
@@ -46,7 +44,8 @@ RUN dnf install -y \
     dnsmasq \
     # For cloud-init ISO
     genisoimage \
-    && dnf clean all
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
 
 # =============================================================================
 # Configuration
