@@ -52,11 +52,69 @@ class ContainerImage:
 
 
 @dataclass
+class QuadletImage:
+    id: str
+    image: str
+    description: str = ""
+    quadlet_file: str = ""
+
+
+@dataclass
 class DependencyManifest:
     name: str
     version: str
     bootstrap: list[BootstrapBinary] = field(default_factory=list)
     images: list[ContainerImage] = field(default_factory=list)
+    quadlet: list[QuadletImage] = field(default_factory=list)
+
+
+def _parse_bootstrap_items(raw_items: list[dict]) -> list[BootstrapBinary]:
+    """Parse bootstrap binary entries from the manifest."""
+    result: list[BootstrapBinary] = []
+    for item in raw_items:
+        artifacts: dict[str, Artifact] = {}
+        for arch, artifact_data in item.get("artifacts", {}).items():
+            artifacts[arch] = Artifact(
+                url=artifact_data.get("url", ""),
+                sha256=artifact_data.get("sha256", ""),
+            )
+        result.append(
+            BootstrapBinary(
+                id=item["id"],
+                version=item.get("version", ""),
+                description=item.get("description", ""),
+                install_path=item.get("installPath", "/usr/local/bin"),
+                artifacts=artifacts,
+            )
+        )
+    return result
+
+
+def _parse_quadlet_items(raw_items: list[dict]) -> list[QuadletImage]:
+    """Parse quadlet image entries from the manifest."""
+    return [
+        QuadletImage(
+            id=item["id"],
+            image=item["image"],
+            description=item.get("description", ""),
+            quadlet_file=item.get("quadletFile", ""),
+        )
+        for item in raw_items
+    ]
+
+
+def _parse_image_items(raw_items: list[dict]) -> list[ContainerImage]:
+    """Parse container image entries from the manifest."""
+    return [
+        ContainerImage(
+            image=item["image"],
+            description=item.get("description", ""),
+            alias=item.get("alias"),
+            replaces=item.get("replaces"),
+            required=item.get("required", False),
+        )
+        for item in raw_items
+    ]
 
 
 def parse_manifest(path: Path) -> DependencyManifest:
@@ -67,41 +125,19 @@ def parse_manifest(path: Path) -> DependencyManifest:
     spec = data.get("spec", {})
     metadata = data.get("metadata", {})
 
-    bootstrap = []
-    for item in spec.get("bootstrap", []):
-        artifacts = {}
-        for arch, artifact_data in item.get("artifacts", {}).items():
-            artifacts[arch] = Artifact(
-                url=artifact_data.get("url", ""),
-                sha256=artifact_data.get("sha256", ""),
-            )
-        bootstrap.append(
-            BootstrapBinary(
-                id=item["id"],
-                version=item["version"],
-                description=item.get("description", ""),
-                install_path=item.get("installPath", "/usr/local/bin"),
-                artifacts=artifacts,
-            )
-        )
+    # Support both "bootstrap" and "bootstrap_legacy" keys
+    bootstrap_raw = spec.get("bootstrap_legacy", spec.get("bootstrap", []))
+    bootstrap = _parse_bootstrap_items(bootstrap_raw)
 
-    images = []
-    for item in spec.get("images", []):
-        images.append(
-            ContainerImage(
-                image=item["image"],
-                description=item.get("description", ""),
-                alias=item.get("alias"),
-                replaces=item.get("replaces"),
-                required=item.get("required", False),
-            )
-        )
+    quadlet = _parse_quadlet_items(spec.get("quadlet", []))
+    images = _parse_image_items(spec.get("images", []))
 
     return DependencyManifest(
         name=metadata.get("name", "unknown"),
         version=metadata.get("version", "0.0.0"),
         bootstrap=bootstrap,
         images=images,
+        quadlet=quadlet,
     )
 
 
@@ -200,6 +236,15 @@ def output_json(manifest: DependencyManifest) -> None:
     data = {
         "name": manifest.name,
         "version": manifest.version,
+        "quadlet": [
+            {
+                "id": q.id,
+                "image": q.image,
+                "description": q.description,
+                "quadletFile": q.quadlet_file,
+            }
+            for q in manifest.quadlet
+        ],
         "bootstrap": [
             {
                 "id": b.id,
