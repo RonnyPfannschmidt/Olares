@@ -60,30 +60,12 @@ build_installer() {
     
     local image="${REGISTRY}/installer:${VERSION}"
     
-    # Create build context with necessary files
-    local context_dir="${BUILD_DIR}/installer-context"
-    rm -rf "$context_dir"
-    mkdir -p "$context_dir"
-    
-    # Copy required files
-    cp -r "${SCRIPT_DIR}/scripts" "$context_dir/"
-    cp "${SCRIPT_DIR}/dependencies.yaml" "$context_dir/"
-    cp "${SCRIPT_DIR}/Containerfile.installer" "$context_dir/Containerfile"
-    
-    # Copy wizard config (Helm charts)
-    if [[ -d "${PROJECT_ROOT}/build/base-package/wizard" ]]; then
-        cp -r "${PROJECT_ROOT}/build/base-package/wizard" "$context_dir/"
-    else
-        mkdir -p "$context_dir/wizard/config"
-        log_warn "Wizard config not found, creating placeholder"
-    fi
-    
-    # Build
+    # Build using repo root as context (matches CI workflow)
     $RUNTIME build \
         --platform "$PLATFORM" \
         -t "$image" \
-        -f "$context_dir/Containerfile" \
-        "$context_dir"
+        -f "${SCRIPT_DIR}/Containerfile.installer" \
+        "$PROJECT_ROOT"
     
     log_info "Built: $image"
 }

@@ -57,11 +57,9 @@ RUN curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/$
 # Create directories
 RUN mkdir -p /olares/charts /olares/config /olares/scripts
 
-# Copy Helm charts
-COPY wizard/config/ /olares/charts/
-
-# Copy configuration templates
-COPY build/container-native/config/ /olares/config/
+# Copy Helm charts (from build/base-package/wizard/config/ in repo root context)
+# This COPY is allowed to fail if wizard charts are not present yet
+COPY build/base-package/wizard/config/ /olares/charts/
 
 # Copy installation scripts
 COPY build/container-native/scripts/ /olares/scripts/
