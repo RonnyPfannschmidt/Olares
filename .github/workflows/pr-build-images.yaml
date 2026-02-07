@@ -339,10 +339,136 @@ jobs:
           retention-days: 3
 
   # ==========================================================================
+  # Smoke test: boot the OS image in a VM and verify k3s works
+  # Triggered by adding the 'smoke-test' label to the PR
+  # ==========================================================================
+  smoke-test:
+    needs: [prepare, build-images]
+    if: contains(github.event.pull_request.labels.*.name, 'smoke-test')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install QEMU and UEFI firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils ovmf
+
+      - name: Generate SSH key for VM access
+        run: |
+          ssh-keygen -t ed25519 -f /tmp/ci-key -N "" -C "ci@smoke-test"
+          echo "Public key:"
+          cat /tmp/ci-key.pub
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Create image-builder config (injects SSH key)
+        run: |
+          cat > /tmp/config.toml << TOML_EOF
+          [[customizations.user]]
+          name = "root"
+          password = "ci-test"
+          key = "$(cat /tmp/ci-key.pub)"
+          TOML_EOF
+
+      - name: Build QCOW2 from OS image
+        run: |
+          mkdir -p output
+
+          sudo podman run --rm --privileged \
+            --security-opt label=type:unconfined_t \
+            -v $(pwd)/output:/output \
+            -v /tmp/config.toml:/config.toml:ro \
+            -v /var/lib/containers/storage:/var/lib/containers/storage \
+            quay.io/centos-bootc/bootc-image-builder:latest \
+            --type qcow2 \
+            --config /config.toml \
+            --output /output \
+            ${{ needs.prepare.outputs.registry }}/olares-os:${{ needs.prepare.outputs.tag }}
+
+          echo "QCOW2 built:"
+          ls -lh output/qcow2/
+
+      - name: Boot VM with QEMU
+        run: |
+          QCOW2=$(find output -name "*.qcow2" | head -1)
+
+          # Copy UEFI vars (needs to be writable)
+          cp /usr/share/OVMF/OVMF_VARS_4M.fd /tmp/efivars.fd 2>/dev/null \
+            || cp /usr/share/OVMF/OVMF_VARS.fd /tmp/efivars.fd
+
+          # Detect OVMF code path
+          OVMF_CODE="/usr/share/OVMF/OVMF_CODE_4M.fd"
+          [ -f "$OVMF_CODE" ] || OVMF_CODE="/usr/share/OVMF/OVMF_CODE.fd"
+
+          qemu-system-x86_64 \
+            -machine q35,accel=kvm \
+            -cpu host \
+            -m 4096 \
+            -smp 2 \
+            -drive "if=pflash,format=raw,readonly=on,file=${OVMF_CODE}" \
+            -drive "if=pflash,format=raw,file=/tmp/efivars.fd" \
+            -drive "file=${QCOW2},format=qcow2,if=virtio" \
+            -netdev user,id=net0,hostfwd=tcp::2222-:22 \
+            -device virtio-net-pci,netdev=net0 \
+            -nographic \
+            -serial file:/tmp/vm-console.log \
+            -daemonize \
+            -pidfile /tmp/qemu.pid
+
+          echo "VM started (PID: $(cat /tmp/qemu.pid))"
+
+      - name: Run smoke tests
+        run: |
+          chmod +x build/container-native/test/smoke-test.sh
+          SSH_KEY=/tmp/ci-key SSH_PORT=2222 \
+            build/container-native/test/smoke-test.sh
+
+      - name: Collect VM logs
+        if: always()
+        run: |
+          mkdir -p logs
+          cp /tmp/vm-console.log logs/console.log 2>/dev/null || true
+
+          # Try to collect logs via SSH if VM is reachable
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR"
+          ssh -i /tmp/ci-key -p 2222 $SSH_OPTS root@localhost \
+            "journalctl -u k3s --no-pager -n 200" > logs/k3s.log 2>/dev/null || true
+          ssh -i /tmp/ci-key -p 2222 $SSH_OPTS root@localhost \
+            "journalctl --no-pager -b -n 500" > logs/boot.log 2>/dev/null || true
+          ssh -i /tmp/ci-key -p 2222 $SSH_OPTS root@localhost \
+            "kubectl get pods -A -o wide" > logs/pods.log 2>/dev/null || true
+          ssh -i /tmp/ci-key -p 2222 $SSH_OPTS root@localhost \
+            "podman ps -a" > logs/podman.log 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-logs-pr-${{ env.PR_NUMBER }}
+          path: logs/
+          retention-days: 7
+
+      - name: Stop VM
+        if: always()
+        run: |
+          if [ -f /tmp/qemu.pid ]; then
+            kill "$(cat /tmp/qemu.pid)" 2>/dev/null || true
+          fi
+
+  # ==========================================================================
   # Post summary comment on PR
   # ==========================================================================
   summary:
-    needs: [prepare, build-images, build-netinstall, build-test-os, build-test-vm]
+    needs: [prepare, build-images, build-netinstall, build-test-os, build-test-vm, smoke-test]
     if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -359,13 +485,21 @@ jobs:
             const prNumber = '${{ env.PR_NUMBER }}';
             
             const buildResult = '${{ needs.build-images.result }}';
-            const allSucceeded = buildResult === 'success'
+            const smokeResult = '${{ needs.smoke-test.result }}';
+            const allBuildsSucceeded = buildResult === 'success'
               && '${{ needs.build-netinstall.result }}' === 'success'
               && '${{ needs.build-test-os.result }}' === 'success'
               && '${{ needs.build-test-vm.result }}' === 'success';
+            // smoke-test is optional (label-gated), so skipped is OK
+            const smokeOk = smokeResult === 'success' || smokeResult === 'skipped';
+            const allSucceeded = allBuildsSucceeded && smokeOk;
             
             if (!allSucceeded) {
-              const failBody = `## ❌ Container Image Build Failed\n\nSome image builds did not succeed.\n\n| Job | Result |\n|-----|--------|\n| build-images | ${buildResult} |\n| build-netinstall | ${{ needs.build-netinstall.result }} |\n| build-test-os | ${{ needs.build-test-os.result }} |\n| build-test-vm | ${{ needs.build-test-vm.result }} |\n\nCheck the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\n\n<sub>From commit ${sha}</sub>`;
+              let rows = `| build-images | ${buildResult} |\n| build-netinstall | ${{ needs.build-netinstall.result }} |\n| build-test-os | ${{ needs.build-test-os.result }} |\n| build-test-vm | ${{ needs.build-test-vm.result }} |`;
+              if (smokeResult !== 'skipped') {
+                rows += `\n| smoke-test | ${smokeResult} |`;
+              }
+              const failBody = `## ❌ Container Image Build Failed\n\nSome jobs did not succeed.\n\n| Job | Result |\n|-----|--------|\n${rows}\n\nCheck the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\n\n<sub>From commit ${sha}</sub>`;
               
               const { data: comments } = await github.rest.issues.listComments({
                 owner: context.repo.owner,
@@ -440,7 +574,8 @@ jobs:
             3. Test → Repeat
             
             > 💡 Add the \`build-vm\` label to generate a pre-built QCOW2 artifact.
-            
+            > 💡 Add the \`smoke-test\` label to boot the OS in a VM and run smoke tests.
+            ${smokeResult === 'success' ? '\n### ✅ Smoke Test Passed\n\nThe OS image was booted in a VM and k3s + basic Kubernetes operations verified.\nSee [workflow logs](' + '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}' + ') for details.\n' : ''}
             <sub>Built from commit ${sha}</sub>`;
             
             // Find existing comment

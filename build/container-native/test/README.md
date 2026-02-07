@@ -165,6 +165,17 @@ When you open a PR, the `pr-build-images.yaml` workflow builds:
 - `ghcr.io/<your-fork>/olares-netinstall:pr-<number>`
 - Other component images
 
+### 1b. CI Smoke Tests (optional)
+
+Add the `smoke-test` label to your PR to automatically:
+1. Build a QCOW2 from the OS image
+2. Boot it in a QEMU VM on the GitHub Actions runner (KVM-accelerated)
+3. Wait for k3s to become Ready
+4. Run smoke tests (systemd services, kubectl, pod creation)
+5. Upload logs as artifacts
+
+The smoke test script is at `test/smoke-test.sh` and can also be run locally.
+
 ### 2. Start Test VM
 
 ```bash
