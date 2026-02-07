@@ -210,7 +210,7 @@ setup_disk() {
 }
 
 # Create initial disk from a cloud image
-# This uses a generic Fedora/CentOS cloud image and cloud-init to bootc switch
+# This uses a Fedora cloud image and cloud-init to run bootc install to-existing-root
 create_initial_disk() {
     local cloud_image_url="${VM_CLOUD_IMAGE_URL:-https://download.fedoraproject.org/pub/fedora/linux/releases/41/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-41-1.4.x86_64.qcow2}"
     local cloud_image="/vm/cloud-base.qcow2"
@@ -254,11 +254,18 @@ setup_cloud_init() {
     # Marker file to track if we've done initial switch
     local switch_marker="/var/lib/olares-switched"
     
-    # Create user-data that handles both initial switch and updates
+    # Create user-data that handles both initial install and updates
+    #
+    # IMPORTANT: On a regular Fedora Cloud image (non-bootc), "bootc switch"
+    # does NOT work because the system is not ostree-managed. Instead we use
+    # "bootc install to-existing-root" which must be run FROM a container
+    # image (via podman). This converts the system to a bootc deployment.
+    #
+    # On subsequent boots (already bootc-managed), "bootc upgrade" works.
     cat > "${ci_dir}/user-data" << EOF
 #cloud-config
 # Olares Test VM Cloud-Init Configuration
-# Handles: initial bootc switch OR subsequent updates
+# Handles: initial bootc install OR subsequent updates
 
 # Set password for root (for debugging)
 chpasswd:
@@ -276,49 +283,51 @@ runcmd:
     set -x
     SWITCH_MARKER="${switch_marker}"
     TARGET_IMAGE="${FULL_IMAGE}"
+    LOG="/var/log/olares-bootstrap.log"
     
-    echo "=== Olares Test VM Bootstrap ===" | tee -a /var/log/olares-bootstrap.log
-    date | tee -a /var/log/olares-bootstrap.log
+    echo "=== Olares Test VM Bootstrap ===" | tee -a "\$LOG"
+    date | tee -a "\$LOG"
+    echo "Target: \$TARGET_IMAGE" | tee -a "\$LOG"
     
-    if command -v bootc &>/dev/null; then
-      echo "bootc is available" | tee -a /var/log/olares-bootstrap.log
-      
-      if [[ -f "\$SWITCH_MARKER" ]]; then
-        # Already switched - just check for updates
-        echo "Checking for updates to \$TARGET_IMAGE..." | tee -a /var/log/olares-bootstrap.log
-        if bootc upgrade 2>&1 | tee -a /var/log/olares-bootstrap.log; then
-          if bootc status | grep -q "staged"; then
-            echo "Update staged, rebooting..." | tee -a /var/log/olares-bootstrap.log
-            touch /run/reboot-required
-          fi
-        fi
-      else
-        # First boot - do the switch
-        echo "First boot: switching to \$TARGET_IMAGE..." | tee -a /var/log/olares-bootstrap.log
-        if bootc switch --retain "\$TARGET_IMAGE" 2>&1 | tee -a /var/log/olares-bootstrap.log; then
-          touch "\$SWITCH_MARKER"
-          echo "Switch successful, rebooting..." | tee -a /var/log/olares-bootstrap.log
+    if [[ -f "\$SWITCH_MARKER" ]]; then
+      # Already installed - check for updates via bootc upgrade
+      echo "System already installed, checking for updates..." | tee -a "\$LOG"
+      if bootc upgrade 2>&1 | tee -a "\$LOG"; then
+        if bootc status | grep -q "staged"; then
+          echo "Update staged, rebooting..." | tee -a "\$LOG"
           touch /run/reboot-required
         else
-          echo "ERROR: bootc switch failed" | tee -a /var/log/olares-bootstrap.log
+          echo "Already up to date" | tee -a "\$LOG"
         fi
       fi
     else
-      # No bootc yet - install it (Fedora cloud image)
-      echo "Installing bootc..." | tee -a /var/log/olares-bootstrap.log
-      dnf install -y bootc 2>&1 | tee -a /var/log/olares-bootstrap.log || true
+      # First boot on a non-bootc system (e.g., Fedora Cloud)
+      # Use "bootc install to-existing-root" which must run FROM the target
+      # container image. This converts the running system to bootc-managed.
+      echo "First boot: installing bootc from \$TARGET_IMAGE..." | tee -a "\$LOG"
       
-      if command -v bootc &>/dev/null; then
-        echo "bootc installed, switching to \$TARGET_IMAGE..." | tee -a /var/log/olares-bootstrap.log
-        if bootc switch --retain "\$TARGET_IMAGE" 2>&1 | tee -a /var/log/olares-bootstrap.log; then
-          touch "\$SWITCH_MARKER"
-          echo "Switch successful, rebooting..." | tee -a /var/log/olares-bootstrap.log
-          touch /run/reboot-required
-        else
-          echo "ERROR: bootc switch failed" | tee -a /var/log/olares-bootstrap.log
-        fi
+      # Ensure podman is available (Fedora Cloud has it or can install it)
+      if ! command -v podman &>/dev/null; then
+        echo "Installing podman..." | tee -a "\$LOG"
+        dnf install -y podman 2>&1 | tee -a "\$LOG"
+      fi
+      
+      echo "Running bootc install to-existing-root..." | tee -a "\$LOG"
+      if podman run --rm --privileged \
+          --pid=host \
+          -v /dev:/dev \
+          -v /:/target \
+          -v /var/lib/containers:/var/lib/containers \
+          --security-opt label=type:unconfined_t \
+          "\$TARGET_IMAGE" \
+          bootc install to-existing-root \
+            --target-no-signature-verification 2>&1 | tee -a "\$LOG"; then
+        touch "\$SWITCH_MARKER"
+        echo "Install successful, rebooting..." | tee -a "\$LOG"
+        touch /run/reboot-required
       else
-        echo "ERROR: Failed to install bootc" | tee -a /var/log/olares-bootstrap.log
+        echo "ERROR: bootc install to-existing-root failed" | tee -a "\$LOG"
+        echo "Check \$LOG for details" | tee -a "\$LOG"
       fi
     fi
 
@@ -350,8 +359,8 @@ EOF
     
     log "Cloud-init configured:"
     log "  - Root password: olares"
-    log "  - First boot: install bootc, switch to ${FULL_IMAGE}"
-    log "  - Subsequent boots: check for updates"
+    log "  - First boot: bootc install to-existing-root from ${FULL_IMAGE}"
+    log "  - Subsequent boots: bootc upgrade"
 }
 
 # Start QEMU
