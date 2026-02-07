@@ -8,7 +8,7 @@ This script:
 3. Runs the test VM container with the correct registry/tag
 
 Usage:
-    ./run-test-from-pr.py [--dry-run] [--share-storage]
+    ./run-test-from-pr.py [--dry-run]
 """
 from __future__ import annotations
 
@@ -334,7 +334,6 @@ def wait_for_workflow(owner: str, repo: str, pr_number: int) -> bool:
 def build_podman_command(
     pr_info: PRInfo,
     *,
-    share_storage: bool = False,
     data_dir: Path | None = None,
     network_mode: str = "tap",
     hostname: str | None = None,
@@ -378,27 +377,6 @@ def build_podman_command(
     # Always expose VNC
     cmd.extend(["-p", "5900:5900"])
 
-    # Add storage sharing if requested
-    if share_storage:
-        # Detect rootless vs rootful podman storage
-        rootless_storage = Path.home() / ".local/share/containers/storage"
-        rootful_storage = Path("/var/lib/containers/storage")
-
-        if rootless_storage.exists():
-            storage_path = rootless_storage
-        elif rootful_storage.exists():
-            storage_path = rootful_storage
-        else:
-            print(
-                "Warning: Could not find podman storage, skipping share",
-                file=sys.stderr,
-            )
-            storage_path = None
-
-        if storage_path:
-            cmd.extend(["-v", f"{storage_path}:/shared-storage:ro"])
-            cmd.extend(["-e", "VM_SHARE_STORAGE=true"])
-
     # Add the image
     image = f"{pr_info.registry}/olares-test-vm:{pr_info.tag}"
     cmd.append(image)
@@ -416,12 +394,6 @@ def main() -> int:
         "-n",
         action="store_true",
         help="Print the command without running it",
-    )
-    parser.add_argument(
-        "--share-storage",
-        "-s",
-        action="store_true",
-        help="Share host podman storage with the VM",
     )
     parser.add_argument(
         "--data-dir",
@@ -518,7 +490,6 @@ def main() -> int:
     # Build the command
     cmd = build_podman_command(
         pr_info,
-        share_storage=args.share_storage,
         data_dir=args.data_dir,
         network_mode=args.network,
         hostname=args.hostname,

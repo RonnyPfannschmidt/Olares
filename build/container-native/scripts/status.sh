@@ -53,7 +53,9 @@ echo ""
 
 # Check container runtime
 echo "Container Runtime:"
-if [[ -S /var/run/containerd/containerd.sock ]]; then
+if [[ -S /var/run/podman/podman.sock ]]; then
+    echo -e "  $check_mark podman socket available"
+elif [[ -S /var/run/containerd/containerd.sock ]]; then
     echo -e "  $check_mark containerd socket available"
 elif [[ -S /var/run/docker.sock ]]; then
     echo -e "  $check_mark docker socket available"

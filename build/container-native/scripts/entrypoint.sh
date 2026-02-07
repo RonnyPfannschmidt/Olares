@@ -34,24 +34,34 @@ Environment Variables:
     CONTAINER_RUNTIME       Container runtime socket path
 
 Examples:
-    # Install Olares
+    # Install Olares (Quadlet-based OS with podman)
     podman run --rm -it --privileged --net=host \\
-        -v /var/run/containerd:/var/run/containerd \\
+        -v /run/podman:/var/run/podman \\
         -v /etc:/host-etc \\
         -v /var/lib:/host-var-lib \\
         ghcr.io/olares/installer:latest install
 
-    # Pre-pull images only
+    # Pre-pull images (NOTE: on Quadlet OS, images pulled here go to
+    # host podman, not k3s containerd - k3s pulls images on demand)
     podman run --rm -it --net=host \\
-        -v /var/run/containerd:/var/run/containerd \\
+        -v /run/podman:/var/run/podman \\
         ghcr.io/olares/installer:latest pull-images
 
 EOF
 }
 
 # Ensure we have access to container runtime
+#
+# NOTE: On Quadlet-based Olares OS, the host runtime is podman and k3s runs
+# as a container with its own embedded containerd. Images pulled via podman
+# are NOT visible to k3s. For pre-pulling into k3s, use crictl (which execs
+# into the k3s container) or let k3s pull images on demand.
 check_runtime() {
-    if [[ -S /var/run/containerd/containerd.sock ]]; then
+    if [[ -S /var/run/podman/podman.sock ]]; then
+        export CONTAINER_RUNTIME="podman"
+        export CONTAINER_SOCKET="/var/run/podman/podman.sock"
+        echo "Using podman runtime"
+    elif [[ -S /var/run/containerd/containerd.sock ]]; then
         export CONTAINER_RUNTIME="containerd"
         export CONTAINER_SOCKET="/var/run/containerd/containerd.sock"
         echo "Using containerd runtime"

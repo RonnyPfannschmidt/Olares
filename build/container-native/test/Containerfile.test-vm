@@ -19,16 +19,11 @@
 #     -e OLARES_TAG=pr-123 \
 #     olares-test-vm
 #
-#   # Share host podman storage to avoid re-downloading images:
-#   podman run --rm -it --privileged \
-#     --device /dev/kvm \
-#     -v ./vm-data:/vm \
-#     -v ~/.local/share/containers/storage:/var/lib/containers/storage:O \
-#     -e OLARES_REGISTRY=ghcr.io/myuser \
-#     -e OLARES_TAG=pr-123 \
-#     olares-test-vm
-#
 #   # The VM will boot, update to PR images, reboot into Olares
+#
+#   NOTE: With Quadlet-based k3s, the guest's k3s uses its own embedded
+#   containerd. Sharing host podman storage does NOT make images visible
+#   to k3s. Images will be pulled by k3s on demand.
 
 FROM fedora:41
 
@@ -71,11 +66,6 @@ ENV VM_VNC_PORT=5900
 
 # Disk path (must be mounted from host for persistence)
 ENV VM_DISK=/vm/disk.qcow2
-
-# Share container storage with guest via virtiofs
-# When enabled, host podman storage is shared with the VM
-# Requires: -v ~/.local/share/containers/storage:/var/lib/containers/storage:O
-ENV VM_SHARE_STORAGE=true
 
 # Network mode: "user" (port forwarding) or "tap" (bridged, VM gets own IP)
 ENV VM_NETWORK_MODE=tap

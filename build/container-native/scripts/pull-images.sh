@@ -20,8 +20,15 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
 # Detect container runtime
+#
+# NOTE: On Quadlet-based Olares OS, the host runtime is podman but k3s uses
+# its own embedded containerd. Images pulled into podman are NOT visible to
+# k3s. This script is useful for pre-caching in the host runtime or for
+# non-Quadlet deployments.
 detect_runtime() {
-    if [[ -S /var/run/containerd/containerd.sock ]]; then
+    if [[ -S /var/run/podman/podman.sock ]]; then
+        echo "podman"
+    elif [[ -S /var/run/containerd/containerd.sock ]]; then
         echo "containerd"
     elif [[ -S /var/run/docker.sock ]]; then
         echo "docker"
@@ -38,6 +45,9 @@ pull_image() {
     local runtime="$2"
 
     case "$runtime" in
+        podman)
+            podman pull "$image" 2>&1
+            ;;
         containerd)
             ctr -n k8s.io images pull "$image" 2>&1
             ;;
@@ -60,6 +70,9 @@ export_image() {
     safe_name=$(echo "$image" | tr '/:' '_')
 
     case "$runtime" in
+        podman)
+            podman save "$image" -o "${output_dir}/${safe_name}.tar"
+            ;;
         containerd)
             ctr -n k8s.io images export "${output_dir}/${safe_name}.tar" "$image"
             ;;

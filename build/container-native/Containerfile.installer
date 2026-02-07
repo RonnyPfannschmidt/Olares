@@ -7,9 +7,9 @@
 # Build:
 #   podman build -t ghcr.io/olares/installer:latest -f Containerfile.installer .
 #
-# Run:
+# Run (on Quadlet-based Olares OS):
 #   podman run --rm -it --privileged --net=host \
-#     -v /var/run/containerd:/var/run/containerd \
+#     -v /run/podman:/var/run/podman \
 #     -v /etc:/host-etc \
 #     -v /var/lib:/host-var-lib \
 #     ghcr.io/olares/installer:latest

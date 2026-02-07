@@ -132,8 +132,8 @@ spec:
 
     # -------------------------------------------------------------------------
     # CLI Tools (run as containers)
-    # NOTE: k3s provides kubectl/crictl via symlinks on the host, but these
-    # container images are useful for the installer and containerized workflows
+    # NOTE: On the OS image, kubectl/crictl exec into the k3s container.
+    # These container images are used by the installer and CI workflows.
     # -------------------------------------------------------------------------
     - image: bitnami/kubectl:1.32.3
       description: "Kubernetes CLI (for installer container)"

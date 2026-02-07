@@ -76,19 +76,12 @@ build_os() {
     
     local image="${REGISTRY}/os:${VERSION}"
     
-    # Create build context
-    local context_dir="${BUILD_DIR}/os-context"
-    rm -rf "$context_dir"
-    mkdir -p "$context_dir"
-    
-    cp "${SCRIPT_DIR}/Containerfile.olares-os" "$context_dir/Containerfile"
-    
-    # Build
+    # Build using SCRIPT_DIR as context (Containerfile.olares-os COPYs quadlet/ files)
     $RUNTIME build \
         --platform "$PLATFORM" \
         -t "$image" \
-        -f "$context_dir/Containerfile" \
-        "$context_dir"
+        -f "${SCRIPT_DIR}/Containerfile.olares-os" \
+        "${SCRIPT_DIR}"
     
     log_info "Built: $image"
 }

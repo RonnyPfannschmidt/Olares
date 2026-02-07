@@ -56,7 +56,7 @@ check_prerequisites() {
     # Check container runtime access
     if [[ -z "${CONTAINER_RUNTIME:-}" ]]; then
         log_error "No container runtime detected"
-        log_error "Mount the runtime socket (e.g., -v /var/run/containerd:/var/run/containerd)"
+        log_error "Mount the runtime socket (e.g., -v /run/podman:/var/run/podman)"
         exit 1
     fi
 
@@ -97,6 +97,12 @@ wait_for_kubernetes() {
 }
 
 # Pull required container images
+#
+# NOTE: On Quadlet-based Olares OS, k3s uses its own embedded containerd.
+# Images pulled into the host runtime (podman) are NOT visible to k3s.
+# k3s will pull images on demand when pods are scheduled.
+# This function is most useful for non-Quadlet deployments or pre-caching
+# images in the host runtime for other purposes.
 pull_images() {
     log_info "Pulling required container images..."
 
@@ -125,6 +131,9 @@ pull_images() {
         fi
 
         case "$CONTAINER_RUNTIME" in
+            podman)
+                podman pull "$image" || log_warn "Failed to pull: $image"
+                ;;
             containerd)
                 ctr -n k8s.io images pull "$image" || log_warn "Failed to pull: $image"
                 ;;
