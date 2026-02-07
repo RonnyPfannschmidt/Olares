@@ -135,7 +135,7 @@ spec:
     # NOTE: On the OS image, kubectl/crictl exec into the k3s container.
     # These container images are used by the installer and CI workflows.
     # -------------------------------------------------------------------------
-    - image: bitnami/kubectl:1.32.3
+    - image: rancher/kubectl:v1.32.3
       description: "Kubernetes CLI (for installer container)"
       alias: kubectl
 

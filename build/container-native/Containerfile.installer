@@ -31,7 +31,7 @@ RUN apk add --no-cache \
 # Stage: Collect CLI tools from their official images
 # ============================================================================
 
-FROM bitnami/kubectl:1.32.3 AS kubectl
+FROM rancher/kubectl:v1.32.3 AS kubectl
 FROM alpine/helm:3.17.1 AS helm
 
 # ============================================================================
@@ -45,7 +45,7 @@ LABEL org.opencontainers.image.description="Container-native Olares installation
 LABEL org.opencontainers.image.source="https://github.com/beclab/Olares"
 
 # Copy kubectl and helm from their official images
-COPY --from=kubectl /opt/bitnami/kubectl/bin/kubectl /usr/local/bin/kubectl
+COPY --from=kubectl /bin/kubectl /usr/local/bin/kubectl
 COPY --from=helm /usr/bin/helm /usr/local/bin/helm
 
 # Install containerd CLI tools (ctr, crictl)
