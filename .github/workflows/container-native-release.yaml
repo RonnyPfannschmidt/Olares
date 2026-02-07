@@ -234,7 +234,7 @@ jobs:
           name: manifests
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           name: v${{ github.event.inputs.version }} (Container-Native)
           tag_name: v${{ github.event.inputs.version }}-container-native

@@ -33,8 +33,6 @@ env:
   # Default to PR author's namespace, can be overridden
   REGISTRY_PREFIX: ${{ inputs.registry_prefix || format('ghcr.io/{0}', github.event.pull_request.head.repo.owner.login || github.repository_owner) }}
   PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number || github.run_number }}
-  IMAGE_TAG: pr-${{ github.event.pull_request.number || inputs.pr_number || github.run_number }}-${{ github.sha }}
-  SHORT_SHA: ${{ github.sha }}
 
 jobs:
   # ==========================================================================
@@ -185,7 +183,7 @@ jobs:
             olares.pr.number=${{ env.PR_NUMBER }}
 
   # ==========================================================================
-  # Build bootc netinstall image
+  # Build bootc netinstall image (uses existing Containerfile.netinstall)
   # ==========================================================================
   build-netinstall:
     needs: [prepare, build-images]
@@ -208,72 +206,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create netinstall Containerfile
-        run: |
-          cat > /tmp/Containerfile.netinstall << EOF
-          # Minimal netinstall image for Olares
-          # This image boots, pulls the full OS image from registry, and installs
-          #
-          # Usage:
-          #   bootc install to-disk --source-imgref <this-image> /dev/sda
-          #   # System reboots and pulls full image on first boot
-          
-          FROM quay.io/centos-bootc/centos-bootc:stream9
-          
-          LABEL org.opencontainers.image.title="Olares Netinstall"
-          LABEL org.opencontainers.image.description="Minimal installer that fetches Olares from registry"
-          LABEL olares.registry="${{ needs.prepare.outputs.registry }}"
-          LABEL olares.tag="${{ needs.prepare.outputs.tag }}"
-          LABEL olares.pr="${{ env.PR_NUMBER }}"
-          
-          # Configure bootc to rebase to full image on first boot
-          RUN mkdir -p /etc/olares
-          
-          COPY <<'BOOTSCRIPT' /usr/lib/systemd/system/olares-firstboot.service
-          [Unit]
-          Description=Olares First Boot - Rebase to full image
-          ConditionPathExists=!/etc/olares/.rebased
-          After=network-online.target
-          Wants=network-online.target
-          
-          [Service]
-          Type=oneshot
-          RemainAfterExit=yes
-          ExecStart=/usr/local/bin/olares-rebase
-          
-          [Install]
-          WantedBy=multi-user.target
-          BOOTSCRIPT
-          
-          COPY <<'REBASESCRIPT' /usr/local/bin/olares-rebase
-          #!/bin/bash
-          set -euo pipefail
-          
-          REGISTRY="${{ needs.prepare.outputs.registry }}"
-          TAG="${{ needs.prepare.outputs.tag }}"
-          FULL_IMAGE="\${REGISTRY}/olares-os:\${TAG}"
-          
-          echo "Olares Netinstall: Rebasing to \${FULL_IMAGE}..."
-          
-          # Rebase to full image
-          bootc switch --transport registry "\${FULL_IMAGE}"
-          
-          # Mark as rebased
-          touch /etc/olares/.rebased
-          
-          echo "Rebase complete. Rebooting to apply..."
-          systemctl reboot
-          REBASESCRIPT
-          
-          RUN chmod +x /usr/local/bin/olares-rebase && \
-              systemctl enable olares-firstboot.service
-          EOF
-
       - name: Build and push netinstall
         uses: docker/build-push-action@v5
         with:
-          context: /tmp
-          file: /tmp/Containerfile.netinstall
+          context: build/container-native
+          file: build/container-native/Containerfile.netinstall
+          build-args: |
+            OLARES_REGISTRY=${{ needs.prepare.outputs.registry }}
+            OLARES_TAG=${{ needs.prepare.outputs.tag }}
           platforms: linux/amd64
           push: true
           tags: |
@@ -418,6 +358,37 @@ jobs:
             const sha = '${{ github.sha }}'.substring(0, 7);
             const prNumber = '${{ env.PR_NUMBER }}';
             
+            const buildResult = '${{ needs.build-images.result }}';
+            const allSucceeded = buildResult === 'success'
+              && '${{ needs.build-netinstall.result }}' === 'success'
+              && '${{ needs.build-test-os.result }}' === 'success'
+              && '${{ needs.build-test-vm.result }}' === 'success';
+            
+            if (!allSucceeded) {
+              const failBody = `## ❌ Container Image Build Failed\n\nSome image builds did not succeed.\n\n| Job | Result |\n|-----|--------|\n| build-images | ${buildResult} |\n| build-netinstall | ${{ needs.build-netinstall.result }} |\n| build-test-os | ${{ needs.build-test-os.result }} |\n| build-test-vm | ${{ needs.build-test-vm.result }} |\n\nCheck the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\n\n<sub>From commit ${sha}</sub>`;
+              
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+              });
+              const botComment = comments.find(c =>
+                c.user.type === 'Bot' && (c.body.includes('Container Images Built') || c.body.includes('Container Image Build Failed'))
+              );
+              if (botComment) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  comment_id: botComment.id, body: failBody
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: context.issue.number, body: failBody
+                });
+              }
+              return;
+            }
+            
             const body = `## 🐳 Container Images Built
             
             All images from this PR are available in the container registry:
@@ -480,7 +451,7 @@ jobs:
             });
             
             const botComment = comments.find(c => 
-              c.user.type === 'Bot' && c.body.includes('Container Images Built')
+              c.user.type === 'Bot' && (c.body.includes('Container Images Built') || c.body.includes('Container Image Build Failed'))
             );
             
             if (botComment) {
