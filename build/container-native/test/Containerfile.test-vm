@@ -31,7 +31,7 @@ LABEL org.opencontainers.image.description="Runs Olares in a VM with auto-update
 # Install QEMU, podman (for bootc-image-builder), and networking tools
 # Using CentOS Stream 9 to match the Olares OS base and avoid EOL churn
 # fuse-overlayfs is required for podman-in-podman (overlay-on-overlay)
-RUN dnf install -y --setopt=install_weak_deps=False \
+RUN dnf install -y --setopt=install_weak_deps=False --allowerasing \
     qemu-kvm \
     qemu-img \
     edk2-ovmf \
