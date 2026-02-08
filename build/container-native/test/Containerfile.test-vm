@@ -23,14 +23,15 @@
 #     -e OLARES_TAG=pr-123 \
 #     olares-test-vm
 
-FROM fedora:41
+FROM quay.io/centos/centos:stream9
 
 LABEL org.opencontainers.image.title="Olares Test VM Runner"
 LABEL org.opencontainers.image.description="Runs Olares in a VM with auto-update on boot"
 
 # Install QEMU, podman (for bootc-image-builder), and networking tools
+# Using CentOS Stream 9 to match the Olares OS base and avoid EOL churn
 RUN dnf install -y --setopt=install_weak_deps=False \
-    qemu-system-x86-core \
+    qemu-kvm \
     qemu-img \
     edk2-ovmf \
     podman \

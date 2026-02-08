@@ -427,7 +427,7 @@ jobs:
             -drive "file=${QCOW2},format=qcow2,if=virtio" \
             -netdev user,id=net0,hostfwd=tcp::2222-:22 \
             -device virtio-net-pci,netdev=net0 \
-            -nographic \
+            -display none \
             -serial file:/tmp/vm-console.log \
             -daemonize \
             -pidfile /tmp/qemu.pid
