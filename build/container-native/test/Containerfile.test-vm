@@ -233,7 +233,7 @@ TOML
     mkdir -p "$output_dir"
 
     if podman run --rm --privileged \
-        --security-opt label=type:unconfined_t \
+        --security-opt label=disable \
         -v "${output_dir}:/output" \
         -v /tmp/config.toml:/config.toml:ro \
         -v /var/lib/containers/storage:/var/lib/containers/storage \
