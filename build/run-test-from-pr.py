@@ -303,7 +303,7 @@ def wait_for_workflow(owner: str, repo: str, pr_number: int) -> bool:
     print("\nWaiting for workflow to complete...")
     print("Press Ctrl+C to stop waiting\n")
     
-    poll_interval = 30  # seconds
+    poll_interval = 10  # seconds
     max_wait = 3600  # 1 hour
     elapsed = 0
     

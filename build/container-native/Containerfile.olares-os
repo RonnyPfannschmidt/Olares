@@ -332,8 +332,8 @@ VOLUME /var/lib/rancher/k3s
 # Olares application data
 VOLUME /var/lib/olares
 
-# User home directories
-VOLUME /home
+# User home directories (bootc uses /var/home, with /home as a symlink)
+VOLUME /var/home
 
 # =============================================================================
 # Boot Configuration
