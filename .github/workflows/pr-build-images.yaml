@@ -315,7 +315,11 @@ jobs:
     steps:
       - name: Login to GHCR
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Pull test-os image (bootc-image-builder requires pre-pulled images)
+        run: |
+          sudo podman pull ${{ needs.prepare.outputs.registry }}/olares-test-os:${{ needs.prepare.outputs.tag }}
 
       - name: Build QCOW2 from test-os (auto-updating)
         run: |
@@ -378,6 +382,10 @@ jobs:
           password = "ci-test"
           key = "$(cat /tmp/ci-key.pub)"
           TOML_EOF
+
+      - name: Pull OS image (bootc-image-builder requires pre-pulled images)
+        run: |
+          sudo podman pull ${{ needs.prepare.outputs.registry }}/olares-os:${{ needs.prepare.outputs.tag }}
 
       - name: Build QCOW2 from OS image
         run: |
@@ -559,12 +567,12 @@ jobs:
             \`\`\`
             
             **First boot:**
-            1. Downloads Fedora cloud image (cached for future runs)
-            2. Installs bootc, switches to Olares OS
+            1. Builds QCOW2 from netinstall image via bootc-image-builder (cached for future runs)
+            2. Netinstall rebases to full Olares OS on first boot
             3. Reboots into Olares
             
             **Subsequent boots:**
-            - Auto-updates to latest PR images
+            - Auto-updates to latest PR images via \`bootc upgrade\`
             - Root password: \`olares\`
             
             ### 📝 Testing Workflow
