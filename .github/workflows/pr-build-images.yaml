@@ -402,6 +402,8 @@ jobs:
             --output /output \
             ${{ needs.prepare.outputs.registry }}/olares-os:${{ needs.prepare.outputs.tag }}
 
+          # Fix permissions (bootc-image-builder runs as root)
+          sudo chmod -R a+r output/
           echo "QCOW2 built:"
           ls -lh output/qcow2/
 
