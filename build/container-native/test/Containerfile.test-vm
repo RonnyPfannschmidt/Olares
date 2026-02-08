@@ -30,11 +30,13 @@ LABEL org.opencontainers.image.description="Runs Olares in a VM with auto-update
 
 # Install QEMU, podman (for bootc-image-builder), and networking tools
 # Using CentOS Stream 9 to match the Olares OS base and avoid EOL churn
+# fuse-overlayfs is required for podman-in-podman (overlay-on-overlay)
 RUN dnf install -y --setopt=install_weak_deps=False \
     qemu-kvm \
     qemu-img \
     edk2-ovmf \
     podman \
+    fuse-overlayfs \
     curl \
     jq \
     # For TAP networking
@@ -43,6 +45,10 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     dnsmasq \
     && dnf clean all \
     && rm -rf /var/cache/dnf
+
+# Configure podman storage for nested container use (overlay-on-overlay)
+RUN sed -i 's|^#mount_program.*|mount_program = "/usr/bin/fuse-overlayfs"|' \
+    /etc/containers/storage.conf
 
 # =============================================================================
 # Configuration
