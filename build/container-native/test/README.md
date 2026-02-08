@@ -39,18 +39,18 @@ podman run --rm -it --privileged \
 
 ### First Run
 
-On first run (no disk image):
-1. Downloads Fedora cloud image (cached in `/vm/cloud-base.qcow2`)
-2. Creates VM disk from cloud image
-3. Boots VM with cloud-init
-4. Cloud-init installs `bootc` and switches to Olares OS
-5. VM reboots into Olares
+On first run (no disk image in `/vm/`):
+1. Pulls the netinstall image from the registry
+2. Runs `bootc-image-builder` to build a QCOW2 (5-10 minutes)
+3. Caches the QCOW2 in `/vm/disk.qcow2`
+4. Boots the VM with UEFI
+5. Netinstall's first-boot service rebases to full Olares OS and reboots
 
 ### Subsequent Runs
 
 On each boot:
-1. Boots existing disk
-2. Cloud-init checks for updates via `bootc upgrade`
+1. Boots existing QCOW2 directly (no rebuild)
+2. `bootc upgrade` checks for image updates
 3. If update available, stages and reboots
 4. Continues into Olares
 
@@ -223,9 +223,7 @@ systemctl reboot
 ### Persistent Data
 
 Data in `/vm` is persistent between container restarts:
-- `disk.qcow2` - VM disk image
-- `cidata/` - Cloud-init configuration
-- `cidata.iso` - Cloud-init ISO
+- `disk.qcow2` - VM disk image (built from netinstall on first run)
 
 ### Debugging
 
