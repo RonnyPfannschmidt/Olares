@@ -1,0 +1,13 @@
+# k3s-data.volume - Persistent storage for k3s
+#
+# This volume stores:
+# - etcd data (cluster state)
+# - containerd images and layers
+# - k3s configuration
+
+[Volume]
+VolumeName=k3s-data
+
+# Labels for identification
+Label=app=k3s
+Label=component=data

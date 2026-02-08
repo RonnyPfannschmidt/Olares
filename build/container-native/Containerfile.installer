@@ -1,0 +1,81 @@
+# Containerfile.installer
+# 
+# This container image runs the Olares installation process.
+# Instead of running scripts directly on the host, we run them
+# inside this container with access to the host's container runtime.
+#
+# Build:
+#   podman build -t ghcr.io/olares/installer:latest -f Containerfile.installer .
+#
+# Run (on Quadlet-based Olares OS):
+#   podman run --rm -it --privileged --net=host \
+#     -v /run/podman:/var/run/podman \
+#     -v /etc:/host-etc \
+#     -v /var/lib:/host-var-lib \
+#     ghcr.io/olares/installer:latest
+
+FROM alpine:3.20 AS base
+
+# Install base tools
+RUN apk add --no-cache \
+    bash \
+    curl \
+    jq \
+    yq \
+    git \
+    openssh-client \
+    ca-certificates \
+    tzdata
+
+# ============================================================================
+# Stage: Collect CLI tools from their official images
+# ============================================================================
+
+FROM rancher/kubectl:v1.32.3 AS kubectl
+FROM alpine/helm:3.17.1 AS helm
+
+# ============================================================================
+# Stage: Final installer image
+# ============================================================================
+
+FROM base AS installer
+
+LABEL org.opencontainers.image.title="Olares Installer"
+LABEL org.opencontainers.image.description="Container-native Olares installation"
+LABEL org.opencontainers.image.source="https://github.com/beclab/Olares"
+
+# Copy kubectl and helm from their official images
+COPY --from=kubectl /bin/kubectl /usr/local/bin/kubectl
+COPY --from=helm /usr/bin/helm /usr/local/bin/helm
+
+# Install containerd CLI tools (ctr, crictl)
+ARG CRICTL_VERSION=v1.32.0
+ARG TARGETARCH
+RUN curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-${TARGETARCH:-amd64}.tar.gz" \
+    | tar -xz -C /usr/local/bin
+
+# Create directories
+RUN mkdir -p /olares/charts /olares/config /olares/scripts
+
+# Copy Helm charts (from build/base-package/wizard/config/ in repo root context)
+# This COPY is allowed to fail if wizard charts are not present yet
+COPY build/base-package/wizard/config/ /olares/charts/
+
+# Copy installation scripts
+COPY build/container-native/scripts/ /olares/scripts/
+RUN chmod +x /olares/scripts/*.sh
+
+# Copy dependencies manifest
+COPY build/container-native/dependencies.yaml /olares/dependencies.yaml
+
+# Default environment
+ENV KUBECONFIG=/host-etc/kubernetes/admin.conf
+ENV OLARES_DATA_DIR=/host-var-lib/olares
+ENV OLARES_CHARTS_DIR=/olares/charts
+
+# Entrypoint
+COPY build/container-native/scripts/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["install"]

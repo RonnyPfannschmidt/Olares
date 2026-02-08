@@ -1,0 +1,616 @@
+# PR Image Build Workflow
+#
+# Builds all Olares container images on PRs, pushing to the contributor's
+# GitHub Container Registry namespace. This allows:
+# - Testing the full image set from a PR
+# - Spinning up VMs with PR-specific images
+# - Integration testing before merge
+#
+# Images are pushed to: ghcr.io/<fork-owner>/olares-<image>:pr-<number>
+# Or for main repo PRs: ghcr.io/beclab/olares-<image>:pr-<number>
+
+name: PR Build Images
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'framework/**'
+      - 'platform/**'
+      - 'infrastructure/**'
+      - 'build/container-native/**'
+      - '.github/workflows/pr-build-images.yaml'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to build (optional, for manual triggers)'
+        required: false
+      registry_prefix:
+        description: 'Registry prefix override (default: ghcr.io/<owner>)'
+        required: false
+
+env:
+  # Default to PR author's namespace, can be overridden
+  REGISTRY_PREFIX: ${{ inputs.registry_prefix || format('ghcr.io/{0}', github.event.pull_request.head.repo.owner.login || github.repository_owner) }}
+  PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number || github.run_number }}
+
+jobs:
+  # ==========================================================================
+  # Prepare build matrix
+  # ==========================================================================
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.matrix.outputs.images }}
+      registry: ${{ steps.registry.outputs.prefix }}
+      tag: ${{ steps.registry.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine registry
+        id: registry
+        run: |
+          # Registry names must be lowercase for GHCR
+          PREFIX=$(echo "${{ env.REGISTRY_PREFIX }}" | tr '[:upper:]' '[:lower:]')
+          TAG="pr-${{ env.PR_NUMBER }}"
+          echo "prefix=${PREFIX}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "📦 Images will be pushed to: ${PREFIX}/olares-*:${TAG}"
+
+      - name: Generate image matrix
+        id: matrix
+        run: |
+          # Define all custom images to build
+          cat > /tmp/images.json << 'EOF'
+          [
+            {
+              "name": "os",
+              "dockerfile": "build/container-native/Containerfile.olares-os",
+              "context": "build/container-native",
+              "platforms": "linux/amd64"
+            },
+            {
+              "name": "installer",
+              "dockerfile": "build/container-native/Containerfile.installer",
+              "context": ".",
+              "platforms": "linux/amd64"
+            },
+            {
+              "name": "app-service",
+              "dockerfile": "framework/app-service/Dockerfile",
+              "context": "framework/app-service",
+              "platforms": "linux/amd64,linux/arm64"
+            },
+            {
+              "name": "bfl",
+              "dockerfile": "framework/bfl/Dockerfile.api",
+              "context": "framework/bfl",
+              "platforms": "linux/amd64,linux/arm64"
+            },
+            {
+              "name": "backup-server",
+              "dockerfile": "framework/backup-server/Dockerfile",
+              "context": "framework/backup-server",
+              "platforms": "linux/amd64,linux/arm64"
+            },
+            {
+              "name": "system-server",
+              "dockerfile": "framework/system-server/Dockerfile",
+              "context": "framework/system-server",
+              "platforms": "linux/amd64,linux/arm64"
+            },
+            {
+              "name": "l4-bfl-proxy",
+              "dockerfile": "framework/l4-bfl-proxy/Dockerfile",
+              "context": "framework/l4-bfl-proxy",
+              "platforms": "linux/amd64,linux/arm64"
+            },
+            {
+              "name": "middleware-operator",
+              "dockerfile": "platform/tapr/docker/middleware/Dockerfile",
+              "context": "platform/tapr",
+              "platforms": "linux/amd64,linux/arm64"
+            }
+          ]
+          EOF
+          
+          # Output as single line JSON
+          IMAGES=$(cat /tmp/images.json | jq -c .)
+          echo "images=${IMAGES}" >> $GITHUB_OUTPUT
+
+  # ==========================================================================
+  # Build all images in parallel
+  # ==========================================================================
+  build-images:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJson(needs.prepare.outputs.images) }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check if Dockerfile exists
+        id: check
+        run: |
+          if [ -f "${{ matrix.image.dockerfile }}" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Dockerfile not found: ${{ matrix.image.dockerfile }}"
+          fi
+
+      - name: Set up QEMU
+        if: steps.check.outputs.exists == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.exists == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: steps.check.outputs.exists == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.image.name }}
+        if: steps.check.outputs.exists == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.dockerfile }}
+          platforms: ${{ matrix.image.platforms }}
+          push: true
+          tags: |
+            ${{ needs.prepare.outputs.registry }}/olares-${{ matrix.image.name }}:${{ needs.prepare.outputs.tag }}
+            ${{ needs.prepare.outputs.registry }}/olares-${{ matrix.image.name }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,scope=${{ matrix.image.name }},mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.ref.name=${{ github.head_ref }}
+            olares.pr.number=${{ env.PR_NUMBER }}
+
+  # ==========================================================================
+  # Build bootc netinstall image (uses existing Containerfile.netinstall)
+  # ==========================================================================
+  build-netinstall:
+    needs: [prepare, build-images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push netinstall
+        uses: docker/build-push-action@v5
+        with:
+          context: build/container-native
+          file: build/container-native/Containerfile.netinstall
+          build-args: |
+            OLARES_REGISTRY=${{ needs.prepare.outputs.registry }}
+            OLARES_TAG=${{ needs.prepare.outputs.tag }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ needs.prepare.outputs.registry }}/olares-netinstall:${{ needs.prepare.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            olares.pr.number=${{ env.PR_NUMBER }}
+
+  # ==========================================================================
+  # Build self-updating test OS image
+  # This image auto-updates from the PR registry on every boot
+  # ==========================================================================
+  build-test-os:
+    needs: [prepare, build-images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push test-os
+        uses: docker/build-push-action@v5
+        with:
+          context: build/container-native/test
+          file: build/container-native/test/Containerfile.test-os
+          build-args: |
+            BASE_IMAGE=${{ needs.prepare.outputs.registry }}/olares-os:${{ needs.prepare.outputs.tag }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ needs.prepare.outputs.registry }}/olares-test-os:${{ needs.prepare.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            olares.pr.number=${{ env.PR_NUMBER }}
+            olares.test.auto-update=enabled
+
+  # ==========================================================================
+  # Build test VM runner container
+  # ==========================================================================
+  build-test-vm:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push test-vm
+        uses: docker/build-push-action@v5
+        with:
+          context: build/container-native/test
+          file: build/container-native/test/Containerfile.test-vm
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ needs.prepare.outputs.registry }}/olares-test-vm:${{ needs.prepare.outputs.tag }}
+            ${{ needs.prepare.outputs.registry }}/olares-test-vm:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            olares.pr.number=${{ env.PR_NUMBER }}
+
+  # ==========================================================================
+  # Generate VM artifacts (optional, on-demand)
+  # ==========================================================================
+  build-vm:
+    needs: [prepare, build-test-os]
+    if: contains(github.event.pull_request.labels.*.name, 'build-vm')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    
+    steps:
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Pull test-os image (bootc-image-builder requires pre-pulled images)
+        run: |
+          sudo podman pull ${{ needs.prepare.outputs.registry }}/olares-test-os:${{ needs.prepare.outputs.tag }}
+
+      - name: Build QCOW2 from test-os (auto-updating)
+        run: |
+          mkdir -p output
+          
+          # Build from test-os which has auto-update enabled
+          sudo podman run --rm --privileged \
+            --security-opt label=type:unconfined_t \
+            -v $(pwd)/output:/output \
+            -v /var/lib/containers/storage:/var/lib/containers/storage \
+            quay.io/centos-bootc/bootc-image-builder:latest \
+            --type qcow2 \
+            --output /output \
+            ${{ needs.prepare.outputs.registry }}/olares-test-os:${{ needs.prepare.outputs.tag }}
+
+      - name: Upload QCOW2
+        uses: actions/upload-artifact@v4
+        with:
+          name: olares-test-os-pr-${{ env.PR_NUMBER }}.qcow2
+          path: output/*.qcow2
+          retention-days: 3
+
+  # ==========================================================================
+  # Smoke test: boot the OS image in a VM and verify k3s works
+  # Triggered by adding the 'smoke-test' label to the PR
+  # ==========================================================================
+  smoke-test:
+    needs: [prepare, build-images]
+    if: contains(github.event.pull_request.labels.*.name, 'smoke-test')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install QEMU and UEFI firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils ovmf
+
+      - name: Generate SSH key for VM access
+        run: |
+          ssh-keygen -t ed25519 -f /tmp/ci-key -N "" -C "ci@smoke-test"
+          echo "Public key:"
+          cat /tmp/ci-key.pub
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Create image-builder config (injects SSH key)
+        run: |
+          cat > /tmp/config.toml << TOML_EOF
+          [[customizations.user]]
+          name = "root"
+          password = "ci-test"
+          key = "$(cat /tmp/ci-key.pub)"
+          TOML_EOF
+
+      - name: Pull OS image (bootc-image-builder requires pre-pulled images)
+        run: |
+          sudo podman pull ${{ needs.prepare.outputs.registry }}/olares-os:${{ needs.prepare.outputs.tag }}
+
+      - name: Build QCOW2 from OS image
+        run: |
+          mkdir -p output
+
+          sudo podman run --rm --privileged \
+            --security-opt label=type:unconfined_t \
+            -v $(pwd)/output:/output \
+            -v /tmp/config.toml:/config.toml:ro \
+            -v /var/lib/containers/storage:/var/lib/containers/storage \
+            quay.io/centos-bootc/bootc-image-builder:latest \
+            --type qcow2 \
+            --config /config.toml \
+            --output /output \
+            ${{ needs.prepare.outputs.registry }}/olares-os:${{ needs.prepare.outputs.tag }}
+
+          # Fix permissions (bootc-image-builder runs as root)
+          sudo chmod -R a+r output/
+          echo "QCOW2 built:"
+          ls -lh output/qcow2/
+
+      - name: Boot VM with QEMU
+        run: |
+          QCOW2=$(find output -name "*.qcow2" | head -1)
+
+          # Copy UEFI vars (needs to be writable)
+          cp /usr/share/OVMF/OVMF_VARS_4M.fd /tmp/efivars.fd 2>/dev/null \
+            || cp /usr/share/OVMF/OVMF_VARS.fd /tmp/efivars.fd
+
+          # Detect OVMF code path
+          OVMF_CODE="/usr/share/OVMF/OVMF_CODE_4M.fd"
+          [ -f "$OVMF_CODE" ] || OVMF_CODE="/usr/share/OVMF/OVMF_CODE.fd"
+
+          qemu-system-x86_64 \
+            -machine q35,accel=kvm \
+            -cpu host \
+            -m 4096 \
+            -smp 2 \
+            -drive "if=pflash,format=raw,readonly=on,file=${OVMF_CODE}" \
+            -drive "if=pflash,format=raw,file=/tmp/efivars.fd" \
+            -drive "file=${QCOW2},format=qcow2,if=virtio" \
+            -netdev user,id=net0,hostfwd=tcp::2222-:22 \
+            -device virtio-net-pci,netdev=net0 \
+            -display none \
+            -serial file:/tmp/vm-console.log \
+            -daemonize \
+            -pidfile /tmp/qemu.pid
+
+          echo "VM started (PID: $(cat /tmp/qemu.pid))"
+
+      - name: Run smoke tests
+        run: |
+          chmod +x build/container-native/test/smoke-test.sh
+          SSH_KEY=/tmp/ci-key SSH_PORT=2222 \
+            build/container-native/test/smoke-test.sh
+
+      - name: Collect VM logs
+        if: always()
+        run: |
+          mkdir -p logs
+          cp /tmp/vm-console.log logs/console.log 2>/dev/null || true
+
+          # Try to collect logs via SSH if VM is reachable
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR"
+          ssh -i /tmp/ci-key -p 2222 $SSH_OPTS root@localhost \
+            "journalctl -u k3s --no-pager -n 200" > logs/k3s.log 2>/dev/null || true
+          ssh -i /tmp/ci-key -p 2222 $SSH_OPTS root@localhost \
+            "journalctl --no-pager -b -n 500" > logs/boot.log 2>/dev/null || true
+          ssh -i /tmp/ci-key -p 2222 $SSH_OPTS root@localhost \
+            "kubectl get pods -A -o wide" > logs/pods.log 2>/dev/null || true
+          ssh -i /tmp/ci-key -p 2222 $SSH_OPTS root@localhost \
+            "podman ps -a" > logs/podman.log 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-logs-pr-${{ env.PR_NUMBER }}
+          path: logs/
+          retention-days: 7
+
+      - name: Stop VM
+        if: always()
+        run: |
+          if [ -f /tmp/qemu.pid ]; then
+            kill "$(cat /tmp/qemu.pid)" 2>/dev/null || true
+          fi
+
+  # ==========================================================================
+  # Post summary comment on PR
+  # ==========================================================================
+  summary:
+    needs: [prepare, build-images, build-netinstall, build-test-os, build-test-vm, smoke-test]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    
+    steps:
+      - name: Post PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const registry = '${{ needs.prepare.outputs.registry }}';
+            const tag = '${{ needs.prepare.outputs.tag }}';
+            const sha = '${{ github.sha }}'.substring(0, 7);
+            const prNumber = '${{ env.PR_NUMBER }}';
+            
+            const buildResult = '${{ needs.build-images.result }}';
+            const smokeResult = '${{ needs.smoke-test.result }}';
+            const allBuildsSucceeded = buildResult === 'success'
+              && '${{ needs.build-netinstall.result }}' === 'success'
+              && '${{ needs.build-test-os.result }}' === 'success'
+              && '${{ needs.build-test-vm.result }}' === 'success';
+            // smoke-test is optional (label-gated), so skipped is OK
+            const smokeOk = smokeResult === 'success' || smokeResult === 'skipped';
+            const allSucceeded = allBuildsSucceeded && smokeOk;
+            
+            if (!allSucceeded) {
+              let rows = `| build-images | ${buildResult} |\n| build-netinstall | ${{ needs.build-netinstall.result }} |\n| build-test-os | ${{ needs.build-test-os.result }} |\n| build-test-vm | ${{ needs.build-test-vm.result }} |`;
+              if (smokeResult !== 'skipped') {
+                rows += `\n| smoke-test | ${smokeResult} |`;
+              }
+              const failBody = `## ❌ Container Image Build Failed\n\nSome jobs did not succeed.\n\n| Job | Result |\n|-----|--------|\n${rows}\n\nCheck the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\n\n<sub>From commit ${sha}</sub>`;
+              
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+              });
+              const botComment = comments.find(c =>
+                c.user.type === 'Bot' && (c.body.includes('Container Images Built') || c.body.includes('Container Image Build Failed'))
+              );
+              if (botComment) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  comment_id: botComment.id, body: failBody
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: context.issue.number, body: failBody
+                });
+              }
+              return;
+            }
+            
+            const body = `## 🐳 Container Images Built
+            
+            All images from this PR are available in the container registry:
+            
+            | Image | Description |
+            |-------|-------------|
+            | \`${registry}/olares-os:${tag}\` | Full Olares OS |
+            | \`${registry}/olares-test-os:${tag}\` | **Auto-updating** OS (updates on every boot) |
+            | \`${registry}/olares-netinstall:${tag}\` | Minimal installer (rebases on first boot) |
+            | \`${registry}/olares-test-vm:${tag}\` | Test VM runner container |
+            
+            ### 🚀 Quick Start (Recommended)
+            
+            From the Olares repo, run:
+            
+            \`\`\`bash
+            ./build/run-test-from-pr.py
+            \`\`\`
+            
+            This auto-detects the current branch, finds the PR, and starts the test VM.
+            
+            ### 🖥️ Manual Test VM
+            
+            \`\`\`bash
+            mkdir -p ~/olares-pr-${prNumber}
+            
+            podman run --rm -it --privileged \\
+              --device /dev/kvm \\
+              -v ~/olares-pr-${prNumber}:/vm \\
+              -e OLARES_REGISTRY=${registry} \\
+              -e OLARES_TAG=${tag} \\
+              -p 5900:5900 \\
+              ${registry}/olares-test-vm:${tag}
+            \`\`\`
+            
+            **First boot:**
+            1. Builds QCOW2 from netinstall image via bootc-image-builder (cached for future runs)
+            2. Netinstall rebases to full Olares OS on first boot
+            3. Reboots into Olares
+            
+            **Subsequent boots:**
+            - Auto-updates to latest PR images via \`bootc upgrade\`
+            - Root password: \`olares\`
+            
+            ### 📝 Testing Workflow
+            
+            1. Push commits → Images rebuild with same tag
+            2. Reboot VM → Auto-updates to latest images
+            3. Test → Repeat
+            
+            > 💡 Add the \`build-vm\` label to generate a pre-built QCOW2 artifact.
+            > 💡 Add the \`smoke-test\` label to boot the OS in a VM and run smoke tests.
+            ${smokeResult === 'success' ? '\n### ✅ Smoke Test Passed\n\nThe OS image was booted in a VM and k3s + basic Kubernetes operations verified.\nSee [workflow logs](' + '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}' + ') for details.\n' : ''}
+            <sub>Built from commit ${sha}</sub>`;
+            
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const botComment = comments.find(c => 
+              c.user.type === 'Bot' && (c.body.includes('Container Images Built') || c.body.includes('Container Image Build Failed'))
+            );
+            
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }

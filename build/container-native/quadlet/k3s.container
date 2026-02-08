@@ -1,0 +1,88 @@
+# k3s.container - Quadlet unit for running k3s as a container
+#
+# This runs k3s (lightweight Kubernetes) as a systemd-managed container.
+# Place in /usr/share/containers/systemd/ for bootc images.
+#
+# Benefits over binary installation:
+# - Atomic updates via container image tags
+# - No host binary management
+# - Consistent across architectures
+# - Easy rollback
+
+[Unit]
+Description=k3s - Lightweight Kubernetes
+Documentation=https://k3s.io
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+# Official k3s image from Rancher
+# Update tag to change k3s version - no binary downloads needed
+Image=docker.io/rancher/k3s:v1.32.3-k3s1
+ContainerName=k3s
+
+# k3s requires privileged mode for full Kubernetes functionality
+# This allows: mounting filesystems, managing cgroups, network namespaces
+PodmanArgs=--privileged
+
+# Host network mode required for proper Kubernetes networking
+# k3s needs to manage host network interfaces for pods
+Network=host
+
+# Required tmpfs mounts (k3s writes runtime data here)
+Tmpfs=/run
+Tmpfs=/var/run
+
+# Ulimits required for k3s
+Ulimit=nproc=65535:65535
+Ulimit=nofile=65535:65535
+
+# Persistent storage for k3s data (etcd, containerd images, etc.)
+Volume=k3s-data.volume:/var/lib/rancher/k3s
+
+# Configuration and kubeconfig export
+Volume=/etc/rancher:/etc/rancher
+
+# CNI directories - Calico DaemonSet writes CNI plugins here
+# Calico's install-cni init container copies binaries from calico/cni image
+Volume=/opt/cni/bin:/opt/cni/bin
+Volume=/etc/cni/net.d:/etc/cni/net.d
+
+# Kubelet needs access to host paths for pod volumes
+Volume=/var/lib/kubelet:/var/lib/kubelet:rshared
+Volume=/var/log/pods:/var/log/pods
+
+# k3s server mode with config file
+Exec=server --config=/etc/rancher/k3s/config.yaml
+
+# Environment configuration
+Environment=K3S_KUBECONFIG_OUTPUT=/etc/rancher/k3s/k3s.yaml
+Environment=K3S_KUBECONFIG_MODE=644
+
+# Log to journald
+LogDriver=journald
+
+# Notify systemd when ready (k3s supports sd_notify)
+Notify=true
+
+# Health check - verify k3s API is responding
+HealthCmd=/bin/k3s kubectl get --raw /healthz
+HealthInterval=30s
+HealthRetries=3
+HealthStartPeriod=120s
+HealthTimeout=10s
+HealthOnFailure=kill
+
+[Service]
+# Restart on failure
+Restart=always
+RestartSec=5s
+
+# Give k3s time to start (pulling images, etc.)
+TimeoutStartSec=300
+
+# Delegate cgroups to container
+Delegate=yes
+
+[Install]
+WantedBy=multi-user.target

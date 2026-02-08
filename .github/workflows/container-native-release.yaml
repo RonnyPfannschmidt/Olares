@@ -1,0 +1,286 @@
+# Container-Native Olares Release Workflow
+#
+# This workflow builds and releases the container-native version of Olares:
+# - Installer container image
+# - Bootc-based OS image
+# - Bootable artifacts (ISO, QCOW2, AMI)
+
+name: Container-Native Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.0.0)'
+        required: true
+      build_iso:
+        description: 'Build bootable ISO'
+        type: boolean
+        default: false
+      build_cloud:
+        description: 'Build cloud images (AMI, GCP)'
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io/olares
+
+jobs:
+  # ==========================================================================
+  # Build container images
+  # ==========================================================================
+  build-images:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - image: installer
+            file: build/container-native/Containerfile.installer
+            context: .
+          - image: os
+            file: build/container-native/Containerfile.olares-os
+            context: build/container-native
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare build context
+        if: matrix.image == 'installer'
+        run: |
+          # Copy necessary files for installer build
+          mkdir -p .build-context
+          cp -r build/container-native/scripts .build-context/
+          cp build/container-native/dependencies.yaml .build-context/
+          cp build/container-native/Containerfile.installer .build-context/Containerfile
+          
+          # Copy wizard config if exists
+          if [ -d build/base-package/wizard ]; then
+            cp -r build/base-package/wizard .build-context/
+          else
+            mkdir -p .build-context/wizard/config
+          fi
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.image == 'installer' && '.build-context' || matrix.context }}
+          file: ${{ matrix.image == 'installer' && '.build-context/Containerfile' || matrix.file }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ matrix.image }}:${{ github.event.inputs.version }}
+            ${{ env.REGISTRY }}/${{ matrix.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Sign image
+        if: github.event_name != 'pull_request'
+        run: |
+          # Install cosign
+          curl -fsSL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o /tmp/cosign
+          chmod +x /tmp/cosign
+          
+          # Sign
+          /tmp/cosign sign --yes ${{ env.REGISTRY }}/${{ matrix.image }}:${{ github.event.inputs.version }}
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+
+  # ==========================================================================
+  # Build bootable ISO
+  # ==========================================================================
+  build-iso:
+    needs: build-images
+    if: github.event.inputs.build_iso == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build ISO
+        run: |
+          mkdir -p output
+          
+          sudo podman run --rm --privileged \
+            --security-opt label=type:unconfined_t \
+            -v $(pwd)/output:/output \
+            quay.io/centos-bootc/bootc-image-builder:latest \
+            --type iso \
+            --output /output \
+            ${{ env.REGISTRY }}/os:${{ github.event.inputs.version }}
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: olares-os-${{ github.event.inputs.version }}.iso
+          path: output/*.iso
+          retention-days: 7
+
+  # ==========================================================================
+  # Build cloud images
+  # ==========================================================================
+  build-cloud:
+    needs: build-images
+    if: github.event.inputs.build_cloud == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        format: [qcow2, raw]
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build ${{ matrix.format }}
+        run: |
+          mkdir -p output
+          
+          sudo podman run --rm --privileged \
+            --security-opt label=type:unconfined_t \
+            -v $(pwd)/output:/output \
+            quay.io/centos-bootc/bootc-image-builder:latest \
+            --type ${{ matrix.format }} \
+            --output /output \
+            ${{ env.REGISTRY }}/os:${{ github.event.inputs.version }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: olares-os-${{ github.event.inputs.version }}.${{ matrix.format }}
+          path: output/*.${{ matrix.format }}
+          retention-days: 7
+
+  # ==========================================================================
+  # Generate images list
+  # ==========================================================================
+  generate-manifest:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Generate images list
+        run: |
+          python build/container-native/parse-dependencies.py \
+            build/container-native/dependencies.yaml \
+            -f images-list > images.txt
+
+      - name: Generate JSON manifest
+        run: |
+          python build/container-native/parse-dependencies.py \
+            build/container-native/dependencies.yaml \
+            -f json > manifest.json
+
+      - name: Upload manifests
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifests
+          path: |
+            images.txt
+            manifest.json
+
+  # ==========================================================================
+  # Create release
+  # ==========================================================================
+  release:
+    needs: [build-images, generate-manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download manifests
+        uses: actions/download-artifact@v4
+        with:
+          name: manifests
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ github.event.inputs.version }} (Container-Native)
+          tag_name: v${{ github.event.inputs.version }}-container-native
+          body: |
+            ## Olares Container-Native Release v${{ github.event.inputs.version }}
+            
+            This is a container-native build of Olares using bootc.
+            
+            ### Container Images
+            
+            ```bash
+            # Pull the installer
+            podman pull ${{ env.REGISTRY }}/installer:${{ github.event.inputs.version }}
+            
+            # Pull the OS image
+            podman pull ${{ env.REGISTRY }}/os:${{ github.event.inputs.version }}
+            ```
+            
+            ### Quick Install
+            
+            ```bash
+            # Run the containerized installer
+            podman run --rm -it --privileged --net=host \
+              -v /var/run/containerd:/var/run/containerd \
+              -v /etc:/host-etc \
+              -v /var/lib:/host-var-lib \
+              ${{ env.REGISTRY }}/installer:${{ github.event.inputs.version }} install
+            ```
+            
+            ### Bootc Install (New Machine)
+            
+            ```bash
+            # From a live environment with bootc
+            bootc install to-disk \
+              --source-imgref ${{ env.REGISTRY }}/os:${{ github.event.inputs.version }} \
+              /dev/sda
+            ```
+            
+            ### Upgrade Existing Bootc System
+            
+            ```bash
+            bootc upgrade --image ${{ env.REGISTRY }}/os:${{ github.event.inputs.version }}
+            ```
+          files: |
+            images.txt
+            manifest.json
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

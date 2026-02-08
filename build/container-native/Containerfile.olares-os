@@ -1,0 +1,360 @@
+# Containerfile.olares-os
+#
+# Bootable container image for Olares OS
+# Based on bootc (https://containers.github.io/bootc/)
+#
+# This creates an immutable OS image that runs k3s as a container (via Quadlet).
+# Zero bootstrap binaries needed - k3s runs in a container, CNI plugins
+# are installed by Calico DaemonSet. The system boots and auto-starts k3s.
+#
+# Build:
+#   podman build --platform linux/amd64 \
+#     -t ghcr.io/olares/os:latest \
+#     -f Containerfile.olares-os .
+#
+# Generate ISO:
+#   sudo podman run --rm --privileged \
+#     -v $(pwd)/output:/output \
+#     quay.io/centos-bootc/bootc-image-builder:latest \
+#     --type iso \
+#     ghcr.io/olares/os:latest
+#
+# Install to disk (from live environment):
+#   bootc install to-disk --source-imgref ghcr.io/olares/os:latest /dev/sda
+
+# =============================================================================
+# Base Image: CentOS Stream 9 with bootc support
+# Alternatives: quay.io/fedora/fedora-bootc:41, registry.opensuse.org/...
+# =============================================================================
+FROM quay.io/centos-bootc/centos-bootc:stream9
+
+# Image metadata
+LABEL org.opencontainers.image.title="Olares OS"
+LABEL org.opencontainers.image.description="Immutable Kubernetes OS for personal cloud"
+LABEL org.opencontainers.image.source="https://github.com/beclab/Olares"
+LABEL org.opencontainers.image.vendor="Olares"
+LABEL bootc.version="1.0"
+
+# =============================================================================
+# System Configuration
+# =============================================================================
+
+# Set timezone and locale
+RUN ln -sf /usr/share/zoneinfo/UTC /etc/localtime
+
+# Install essential packages (kept minimal for immutable OS)
+RUN dnf install -y \
+    # Networking tools
+    iproute \
+    iptables-nft \
+    iputils \
+    bind-utils \
+    # System utilities
+    procps-ng \
+    util-linux \
+    which \
+    # Container tools - podman runs k3s via Quadlet
+    podman \
+    skopeo \
+    # Filesystem
+    e2fsprogs \
+    xfsprogs \
+    lvm2 \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# =============================================================================
+# k3s: Lightweight Kubernetes (via Podman Quadlet)
+#
+# k3s runs as a systemd-managed container via Podman Quadlet.
+# Zero host binaries needed - the k3s container image includes everything:
+# kubelet, apiserver, containerd, kubectl, crictl, ctr.
+#
+# Quadlet auto-generates a systemd service (k3s.service) from the
+# k3s.container unit file at boot time.
+#
+# See: quadlet/k3s.container, quadlet/README.md
+# =============================================================================
+
+# Copy quadlet units for containerized k3s
+COPY quadlet/*.container /usr/share/containers/systemd/
+COPY quadlet/*.volume /usr/share/containers/systemd/
+
+# Create directories that k3s/Calico will need (mounted into the container)
+RUN mkdir -p /etc/rancher/k3s \
+    && mkdir -p /opt/cni/bin \
+    && mkdir -p /etc/cni/net.d \
+    && mkdir -p /var/lib/kubelet \
+    && mkdir -p /var/lib/rancher/k3s \
+    && mkdir -p /var/log/pods
+
+# =============================================================================
+# CNI Directories
+#
+# Calico runs as Kubernetes pods (DaemonSet). Its install-cni init container
+# copies calico and calico-ipam binaries from calico/cni image to /opt/cni/bin.
+# No CNI plugins need to be pre-installed - truly container-native!
+# =============================================================================
+# Directories already created above: /opt/cni/bin, /etc/cni/net.d
+
+# =============================================================================
+# CLI Wrapper Scripts
+# All CLI tools exec into the k3s container - no host binaries needed
+# =============================================================================
+
+# kubectl wrapper - execs into the k3s container
+COPY <<'EOF' /usr/local/bin/kubectl
+#!/bin/bash
+exec podman exec k3s kubectl "$@"
+EOF
+
+# crictl wrapper - execs into the k3s container
+COPY <<'EOF' /usr/local/bin/crictl
+#!/bin/bash
+exec podman exec k3s crictl "$@"
+EOF
+
+# ctr wrapper - execs into the k3s container
+COPY <<'EOF' /usr/local/bin/ctr
+#!/bin/bash
+exec podman exec k3s ctr "$@"
+EOF
+
+# helm wrapper - runs helm in a container with kubeconfig
+COPY <<'EOF' /usr/local/bin/helm
+#!/bin/bash
+exec podman run --rm -i \
+    -v /etc/rancher/k3s/k3s.yaml:/root/.kube/config:ro \
+    --network=host \
+    docker.io/alpine/helm:3.17.1 "$@"
+EOF
+
+RUN chmod +x /usr/local/bin/kubectl \
+    /usr/local/bin/crictl \
+    /usr/local/bin/ctr \
+    /usr/local/bin/helm
+
+# k3s configuration
+COPY <<'EOF' /etc/rancher/k3s/config.yaml
+# k3s server configuration for Olares
+write-kubeconfig-mode: "0644"
+
+# Disable k3s built-in components (Olares uses its own)
+disable:
+  - traefik       # Olares uses its own ingress
+  - servicelb     # Olares uses its own load balancer
+
+# k3s uses its embedded containerd inside the Quadlet container
+disable-agent: false
+
+# Disable k3s built-in flannel (Olares uses Calico)
+flannel-backend: none
+
+# Additional API server SANs
+tls-san:
+  - "olares.local"
+  - "localhost"
+
+kubelet-arg:
+  - "max-pods=250"
+EOF
+
+# =============================================================================
+# Olares Agent
+# =============================================================================
+
+# Olares bootstrap agent (will be replaced with compiled binary)
+COPY <<'AGENT_EOF' /usr/local/bin/olares-agent
+#!/bin/bash
+# Olares Bootstrap Agent
+# This script runs after k3s starts and bootstraps the Olares system
+#
+# k3s runs as a container via Podman Quadlet
+
+set -euo pipefail
+
+OLARES_STATE_DIR="/var/lib/olares"
+OLARES_CONFIG="/etc/olares/config.yaml"
+
+log() {
+    echo "[olares-agent] $(date -Iseconds) $*"
+}
+
+# kubectl is a wrapper that execs into the k3s container
+# helm wrapper - runs helm inside a container with kubeconfig access
+helm() {
+    podman run --rm \
+        -v /etc/rancher/k3s/k3s.yaml:/root/.kube/config:ro \
+        -v /var/lib/olares:/var/lib/olares \
+        --network=host \
+        docker.io/alpine/helm:3.17.1 "$@"
+}
+
+wait_for_k3s() {
+    log "Waiting for k3s to be ready..."
+    local retries=120
+    local count=0
+    
+    # Wait for k3s service to be active
+    while [[ $count -lt 30 ]]; do
+        if systemctl is-active --quiet k3s; then
+            break
+        fi
+        count=$((count + 1))
+        sleep 2
+    done
+    
+    # Then wait for the Kubernetes API to be ready
+    count=0
+    while [[ $count -lt $retries ]]; do
+        if kubectl get nodes &>/dev/null; then
+            log "k3s is ready"
+            return 0
+        fi
+        count=$((count + 1))
+        sleep 2
+    done
+    
+    log "ERROR: Timeout waiting for k3s"
+    return 1
+}
+
+is_bootstrapped() {
+    [[ -f "${OLARES_STATE_DIR}/bootstrapped" ]]
+}
+
+bootstrap() {
+    log "Starting Olares bootstrap..."
+    
+    mkdir -p "$OLARES_STATE_DIR"
+    
+    # Create olares-system namespace
+    kubectl create namespace olares-system --dry-run=client -o yaml | \
+        kubectl apply -f -
+    
+    # Apply system configuration
+    # TODO: Install Helm charts from OCI registry
+    # helm upgrade --install olares-system oci://ghcr.io/olares/charts/system
+    
+    # Mark as bootstrapped
+    date -Iseconds > "${OLARES_STATE_DIR}/bootstrapped"
+    log "Bootstrap complete"
+}
+
+main() {
+    case "${1:-bootstrap}" in
+        bootstrap)
+            wait_for_k3s
+            if is_bootstrapped; then
+                log "System already bootstrapped, skipping"
+            else
+                bootstrap
+            fi
+            ;;
+        status)
+            if is_bootstrapped; then
+                echo "Bootstrapped: $(cat "${OLARES_STATE_DIR}/bootstrapped")"
+            else
+                echo "Not bootstrapped"
+            fi
+            ;;
+        *)
+            echo "Usage: olares-agent {bootstrap|status}"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
+AGENT_EOF
+
+RUN chmod +x /usr/local/bin/olares-agent
+
+# Olares agent systemd service
+COPY <<'EOF' /usr/lib/systemd/system/olares-agent.service
+[Unit]
+Description=Olares Bootstrap Agent
+After=k3s.service
+Requires=k3s.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/olares-agent bootstrap
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# =============================================================================
+# Olares Configuration
+# =============================================================================
+
+# Default configuration
+RUN mkdir -p /etc/olares
+COPY <<'EOF' /etc/olares/config.yaml
+# Olares OS Configuration
+version: "1.0"
+
+# Cluster settings
+cluster:
+  name: olares
+  domain: olares.local
+
+# Storage settings
+storage:
+  data_dir: /var/lib/olares
+  
+# Network settings
+network:
+  # Set to your actual domain for production
+  external_domain: ""
+EOF
+
+# =============================================================================
+# Enable Services
+# =============================================================================
+
+# Note: k3s.service is auto-generated by Quadlet from k3s.container
+# We just need to enable olares-agent which depends on it
+RUN systemctl enable olares-agent.service
+
+# =============================================================================
+# Persistent Data Directories
+# These will be mounted from the host's persistent storage
+# =============================================================================
+
+# k3s data (etcd, containerd images, etc.)
+VOLUME /var/lib/rancher/k3s
+
+# Olares application data
+VOLUME /var/lib/olares
+
+# User home directories (bootc uses /var/home, with /home as a symlink)
+VOLUME /var/home
+
+# =============================================================================
+# Boot Configuration
+# =============================================================================
+
+# Default kernel arguments for bootc
+COPY <<'EOF' /usr/lib/bootc/kargs.d/olares.toml
+kargs = [
+    "systemd.unified_cgroup_hierarchy=1",
+    "cgroup_enable=cpuset",
+    "cgroup_enable=memory",
+    "cgroup_memory=1"
+]
+EOF
+
+# =============================================================================
+# Final Setup
+# =============================================================================
+
+# Clean up
+RUN dnf clean all && rm -rf /var/cache/dnf /tmp/*
+
+# Set default target
+RUN systemctl set-default multi-user.target

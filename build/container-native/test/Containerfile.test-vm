@@ -1,0 +1,378 @@
+# Containerfile.test-vm
+#
+# Container that runs an Olares VM for testing.
+#
+# On first run (no disk), it builds a QCOW2 directly from the Olares
+# netinstall image using bootc-image-builder. The netinstall image is
+# already bootc-managed, so the QCOW2 boots straight into a bootc
+# deployment that rebases to the full Olares OS on first boot.
+#
+# Requirements:
+#   - KVM support on host (/dev/kvm must exist)
+#   - Persistent volume at /vm for disk image caching
+#
+# Usage:
+#   # Build test container
+#   podman build -t olares-test-vm -f Containerfile.test-vm .
+#
+#   # Run (first run builds QCOW2, subsequent runs boot existing disk)
+#   podman run --rm -it --privileged \
+#     --device /dev/kvm \
+#     -v ./vm-data:/vm \
+#     -e OLARES_REGISTRY=ghcr.io/myuser \
+#     -e OLARES_TAG=pr-123 \
+#     olares-test-vm
+
+FROM quay.io/centos/centos:stream9
+
+LABEL org.opencontainers.image.title="Olares Test VM Runner"
+LABEL org.opencontainers.image.description="Runs Olares in a VM with auto-update on boot"
+
+# Install QEMU, podman (for bootc-image-builder), and networking tools
+# Using CentOS Stream 9 to match the Olares OS base and avoid EOL churn
+# fuse-overlayfs is required for podman-in-podman (overlay-on-overlay)
+RUN dnf install -y --setopt=install_weak_deps=False --allowerasing \
+    qemu-kvm \
+    qemu-img \
+    edk2-ovmf \
+    podman \
+    fuse-overlayfs \
+    curl \
+    jq \
+    # For TAP networking
+    iproute \
+    iptables-nft \
+    dnsmasq \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# Configure podman storage for nested container use (overlay-on-overlay)
+RUN sed -i 's|^#mount_program.*|mount_program = "/usr/bin/fuse-overlayfs"|' \
+    /etc/containers/storage.conf
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# Default registry and tag (override via environment)
+ENV OLARES_REGISTRY=ghcr.io/olares
+ENV OLARES_TAG=latest
+ENV OLARES_IMAGE=os
+
+# VM configuration
+ENV VM_MEMORY=4096
+ENV VM_CPUS=2
+ENV VM_DISK_SIZE=50G
+ENV VM_SSH_PORT=2222
+ENV VM_VNC_PORT=5900
+
+# Disk path (must be mounted from host for persistence)
+ENV VM_DISK=/vm/disk.qcow2
+
+# Network mode: "user" (port forwarding) or "tap" (bridged, VM gets own IP)
+ENV VM_NETWORK_MODE=tap
+
+# For TAP mode: VM network configuration
+ENV VM_BRIDGE_IP=192.168.100.1
+ENV VM_BRIDGE_SUBNET=192.168.100.0/24
+ENV VM_DHCP_START=192.168.100.10
+ENV VM_DHCP_END=192.168.100.50
+# VM hostname (used by DHCP/DNS)
+ENV VM_HOSTNAME=olares-test
+
+# =============================================================================
+# Scripts
+# =============================================================================
+
+# Main entrypoint script
+COPY <<'ENTRYPOINT' /usr/local/bin/start-vm
+#!/bin/bash
+set -euo pipefail
+
+VM_DISK="${VM_DISK:-/vm/disk.qcow2}"
+VM_MEMORY="${VM_MEMORY:-4096}"
+VM_CPUS="${VM_CPUS:-2}"
+VM_DISK_SIZE="${VM_DISK_SIZE:-50G}"
+VM_SSH_PORT="${VM_SSH_PORT:-2222}"
+VM_VNC_PORT="${VM_VNC_PORT:-5900}"
+
+# Network configuration
+VM_NETWORK_MODE="${VM_NETWORK_MODE:-tap}"
+VM_BRIDGE_IP="${VM_BRIDGE_IP:-192.168.100.1}"
+VM_BRIDGE_SUBNET="${VM_BRIDGE_SUBNET:-192.168.100.0/24}"
+VM_DHCP_START="${VM_DHCP_START:-192.168.100.10}"
+VM_DHCP_END="${VM_DHCP_END:-192.168.100.50}"
+VM_HOSTNAME="${VM_HOSTNAME:-olares-test}"
+
+OLARES_REGISTRY="${OLARES_REGISTRY:-ghcr.io/olares}"
+OLARES_TAG="${OLARES_TAG:-latest}"
+OLARES_IMAGE="${OLARES_IMAGE:-os}"
+
+# Use the netinstall image - it's a bootc image that rebases to full OS on first boot
+NETINSTALL_IMAGE="${OLARES_REGISTRY}/olares-netinstall:${OLARES_TAG}"
+FULL_IMAGE="${OLARES_REGISTRY}/olares-${OLARES_IMAGE}:${OLARES_TAG}"
+
+# Will be set by setup_network
+VM_IP=""
+
+log() {
+    echo "[test-vm] $(date -Iseconds) $*"
+}
+
+# Check KVM support
+check_kvm() {
+    if [[ ! -e /dev/kvm ]]; then
+        log "ERROR: /dev/kvm not found. Run with --device /dev/kvm"
+        log "If running on Linux, ensure KVM is available:"
+        log "  - Intel: modprobe kvm_intel"
+        log "  - AMD: modprobe kvm_amd"
+        exit 1
+    fi
+    log "KVM support: OK"
+}
+
+# Setup TAP networking with bridge and DHCP
+setup_network() {
+    if [[ "$VM_NETWORK_MODE" != "tap" ]]; then
+        log "Network mode: user (port forwarding)"
+        return 0
+    fi
+    
+    log "Setting up TAP networking..."
+    
+    # Create bridge
+    if ! ip link show br0 &>/dev/null; then
+        ip link add br0 type bridge
+        ip addr add "${VM_BRIDGE_IP}/24" dev br0
+        ip link set br0 up
+        log "Created bridge br0 with IP ${VM_BRIDGE_IP}"
+    fi
+    
+    # Create TAP device for VM
+    if ! ip link show tap0 &>/dev/null; then
+        ip tuntap add tap0 mode tap
+        ip link set tap0 master br0
+        ip link set tap0 up
+        log "Created TAP device tap0"
+    fi
+    
+    # Enable IP forwarding
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    
+    # Setup NAT for outbound traffic
+    iptables -t nat -A POSTROUTING -s "${VM_BRIDGE_SUBNET}" ! -d "${VM_BRIDGE_SUBNET}" -j MASQUERADE
+    iptables -A FORWARD -i br0 -j ACCEPT
+    iptables -A FORWARD -o br0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+    
+    # Start dnsmasq for DHCP and DNS
+    # Use fixed MAC address 52:54:00:12:34:56 (same as QEMU VM)
+    mkdir -p /var/run/dnsmasq
+    cat > /var/run/dnsmasq/dnsmasq.conf << EOF
+interface=br0
+bind-interfaces
+dhcp-range=${VM_DHCP_START},${VM_DHCP_END},12h
+dhcp-option=option:router,${VM_BRIDGE_IP}
+dhcp-option=option:dns-server,${VM_BRIDGE_IP}
+dhcp-host=52:54:00:12:34:56,${VM_HOSTNAME},${VM_DHCP_START}
+address=/${VM_HOSTNAME}/${VM_DHCP_START}
+log-queries
+log-dhcp
+EOF
+    
+    dnsmasq -C /var/run/dnsmasq/dnsmasq.conf --pid-file=/var/run/dnsmasq/dnsmasq.pid
+    log "Started dnsmasq (DHCP: ${VM_DHCP_START}-${VM_DHCP_END})"
+    
+    # Set expected VM IP
+    VM_IP="${VM_DHCP_START}"
+    
+    log "Network mode: tap (VM will get IP ${VM_IP})"
+    log "  VM hostname: ${VM_HOSTNAME}"
+    log "  Access: ssh root@${VM_HOSTNAME} or ssh root@${VM_IP}"
+}
+
+# Create or verify disk image
+setup_disk() {
+    local disk_dir
+    disk_dir=$(dirname "$VM_DISK")
+    
+    if [[ ! -d "$disk_dir" ]]; then
+        log "ERROR: Disk directory not mounted: $disk_dir"
+        log "Run with: -v /path/to/vm-data:/vm"
+        exit 1
+    fi
+    
+    if [[ ! -f "$VM_DISK" ]]; then
+        log "No existing disk found. Building QCOW2 from netinstall image..."
+        log "This is a one-time operation (cached in /vm for future runs)."
+        log ""
+        build_disk_from_netinstall
+    else
+        log "Using existing disk: $VM_DISK"
+    fi
+}
+
+# Build a QCOW2 directly from the netinstall image using bootc-image-builder
+# The netinstall is already a bootc image (based on centos-bootc:stream9),
+# so the resulting QCOW2 boots straight into a proper bootc deployment.
+build_disk_from_netinstall() {
+    log "Building QCOW2 from: ${NETINSTALL_IMAGE}"
+    log "This may take 5-10 minutes on first run..."
+    log ""
+
+    # Create bootc-image-builder config to set root password and SSH
+    cat > /tmp/config.toml << 'TOML'
+[[customizations.user]]
+name = "root"
+password = "olares"
+TOML
+
+    # Build QCOW2 using bootc-image-builder
+    # This runs as a privileged container that reads the netinstall image
+    # and produces a bootable QCOW2 disk.
+    local output_dir="/vm/bib-output"
+    mkdir -p "$output_dir"
+
+    if podman run --rm --privileged \
+        --security-opt label=disable \
+        -v "${output_dir}:/output" \
+        -v /tmp/config.toml:/config.toml:ro \
+        -v /var/lib/containers/storage:/var/lib/containers/storage \
+        quay.io/centos-bootc/bootc-image-builder:latest \
+        --type qcow2 \
+        --config /config.toml \
+        --output /output \
+        "${NETINSTALL_IMAGE}"; then
+        
+        # Move QCOW2 to expected location
+        local built_qcow2
+        built_qcow2=$(find "$output_dir" -name "*.qcow2" | head -1)
+        
+        if [[ -z "$built_qcow2" ]]; then
+            log "ERROR: bootc-image-builder succeeded but no QCOW2 found"
+            ls -la "$output_dir"
+            exit 1
+        fi
+        
+        mv "$built_qcow2" "$VM_DISK"
+        rm -rf "$output_dir"
+        
+        # Resize to target size
+        log "Resizing disk to ${VM_DISK_SIZE}..."
+        qemu-img resize "$VM_DISK" "$VM_DISK_SIZE"
+        
+        log "QCOW2 built successfully: $VM_DISK"
+        log ""
+        log "On first boot, the netinstall service will:"
+        log "  1. Rebase to full Olares OS (${FULL_IMAGE})"
+        log "  2. Reboot into Olares"
+    else
+        log "ERROR: bootc-image-builder failed"
+        log "Check that the image exists: ${NETINSTALL_IMAGE}"
+        exit 1
+    fi
+}
+
+# Start QEMU
+start_qemu() {
+    log "Starting QEMU VM..."
+    log "  Memory: ${VM_MEMORY}M"
+    log "  CPUs: ${VM_CPUS}"
+    log "  Disk: ${VM_DISK}"
+    log ""
+    log "Netinstall image: ${NETINSTALL_IMAGE}"
+    log "Full OS image:    ${FULL_IMAGE}"
+    log ""
+
+    # Detect OVMF paths (bootc images require UEFI)
+    local ovmf_code=""
+    local ovmf_vars=""
+    for code_path in \
+        /usr/share/edk2/ovmf/OVMF_CODE.fd \
+        /usr/share/OVMF/OVMF_CODE_4M.fd \
+        /usr/share/OVMF/OVMF_CODE.fd; do
+        if [[ -f "$code_path" ]]; then
+            ovmf_code="$code_path"
+            break
+        fi
+    done
+    for vars_path in \
+        /usr/share/edk2/ovmf/OVMF_VARS.fd \
+        /usr/share/OVMF/OVMF_VARS_4M.fd \
+        /usr/share/OVMF/OVMF_VARS.fd; do
+        if [[ -f "$vars_path" ]]; then
+            ovmf_vars="$vars_path"
+            break
+        fi
+    done
+
+    if [[ -z "$ovmf_code" ]]; then
+        log "ERROR: OVMF/UEFI firmware not found. bootc images require UEFI boot."
+        exit 1
+    fi
+
+    # OVMF_VARS must be writable (VM writes EFI variables)
+    cp "$ovmf_vars" /tmp/efivars.fd
+
+    local qemu_args=(
+        -name "olares-test"
+        -machine q35,accel=kvm
+        -cpu host
+        -m "${VM_MEMORY}"
+        -smp "${VM_CPUS}"
+        # UEFI firmware (required for bootc images)
+        -drive "if=pflash,format=raw,readonly=on,file=${ovmf_code}"
+        -drive "if=pflash,format=raw,file=/tmp/efivars.fd"
+        # Disk
+        -drive "file=${VM_DISK},format=qcow2,if=virtio"
+        -vnc ":$(( VM_VNC_PORT - 5900 ))"
+        -serial stdio
+        -monitor none
+    )
+    
+    # Network configuration based on mode
+    if [[ "$VM_NETWORK_MODE" == "tap" ]]; then
+        qemu_args+=(
+            -netdev "tap,id=net0,ifname=tap0,script=no,downscript=no"
+            -device "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56"
+        )
+        log "Network: TAP (VM IP: ${VM_IP}, hostname: ${VM_HOSTNAME})"
+        log "Connect via SSH: ssh root@${VM_HOSTNAME}  (or ssh root@${VM_IP})"
+    else
+        qemu_args+=(
+            -netdev "user,id=net0,hostfwd=tcp::${VM_SSH_PORT}-:22,hostfwd=tcp::6443-:6443,hostfwd=tcp::8080-:80,hostfwd=tcp::8443-:443"
+            -device "virtio-net-pci,netdev=net0"
+        )
+        log "Network: User mode (port forwarding)"
+        log "Connect via SSH: ssh -p ${VM_SSH_PORT} root@localhost"
+    fi
+    log "Connect via VNC: vncviewer localhost:${VM_VNC_PORT}"
+    log ""
+    
+    exec qemu-system-x86_64 "${qemu_args[@]}"
+}
+
+main() {
+    log "============================================"
+    log "Olares Test VM Runner"
+    log "============================================"
+    log ""
+    
+    check_kvm
+    setup_network
+    setup_disk
+    start_qemu
+}
+
+main "$@"
+ENTRYPOINT
+
+RUN chmod +x /usr/local/bin/start-vm
+
+# Volume for VM disk (must be mounted)
+VOLUME /vm
+
+# Expose ports
+EXPOSE 2222 5900 6443 8080 8443
+
+# Default command
+ENTRYPOINT ["/usr/local/bin/start-vm"]

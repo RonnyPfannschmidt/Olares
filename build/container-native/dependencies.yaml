@@ -1,0 +1,231 @@
+# Olares Container-Native Dependencies
+# 
+# This manifest defines dependencies for the container-native Olares OS.
+#
+# =============================================================================
+# DEPLOYMENT APPROACHES:
+#
+# 1. QUADLET (Fully Container-Native)
+#    - k3s runs as a systemd-managed container via Podman Quadlet
+#    - Calico CNI plugins installed by DaemonSet (from calico/cni image)
+#    - kubectl/helm/etc are wrapper scripts that exec into containers
+#    - Zero host binaries needed!
+#    - See: quadlet/k3s.container, quadlet/README.md
+#
+# 2. BINARY FALLBACK (Legacy compatibility)
+#    - k3s binary downloaded to /usr/local/bin
+#    - CNI plugins downloaded to /opt/cni/bin
+#
+# =============================================================================
+
+apiVersion: olares.com/v1alpha1
+kind: DependencyManifest
+metadata:
+  name: olares-dependencies
+  version: "1.0.0"
+
+spec:
+  # ==========================================================================
+  # QUADLET CONTAINER IMAGES (Fully Container-Native)
+  # 
+  # In Quadlet mode, k3s is managed by systemd via Podman Quadlet.
+  # Calico CNI plugins are installed by DaemonSet - no host binaries needed!
+  # ==========================================================================
+  quadlet:
+    # k3s container - replaces k3s binary
+    # Includes: containerd, kubelet, kubectl, crictl, ctr
+    - id: k3s
+      image: docker.io/rancher/k3s:v1.32.3-k3s1
+      description: "Lightweight Kubernetes (container mode)"
+      quadletFile: k3s.container
+
+  # ==========================================================================
+  # BOOTSTRAP BINARIES (Legacy fallback mode)
+  # 
+  # Only used when Quadlet/container mode is not available.
+  # k3s includes: containerd, kubelet, kubectl, crictl, ctr
+  # ==========================================================================
+  bootstrap_legacy:
+    # k3s: Single binary that includes everything
+    - id: k3s
+      version: "1.32.3+k3s1"
+      description: "Lightweight Kubernetes (includes containerd, kubelet, kubectl)"
+      installPath: /usr/local/bin
+      artifacts:
+        linux/amd64:
+          url: https://github.com/k3s-io/k3s/releases/download/v1.32.3+k3s1/k3s
+          sha256: ""  # TODO: Add checksum
+        linux/arm64:
+          url: https://github.com/k3s-io/k3s/releases/download/v1.32.3+k3s1/k3s-arm64
+          sha256: ""
+      symlinks:
+        - kubectl
+        - crictl
+        - ctr
+
+    # CNI plugins (only for legacy binary mode)
+    # In Quadlet mode, Calico DaemonSet installs CNI plugins from container images
+    - id: cni-plugins
+      version: "1.6.2"
+      description: "Container Network Interface plugins (for Calico)"
+      installPath: /opt/cni/bin
+      artifacts:
+        linux/amd64:
+          url: https://github.com/containernetworking/plugins/releases/download/v1.6.2/cni-plugins-linux-amd64-v1.6.2.tgz
+          sha256: ""
+        linux/arm64:
+          url: https://github.com/containernetworking/plugins/releases/download/v1.6.2/cni-plugins-linux-arm64-v1.6.2.tgz
+          sha256: ""
+
+  # ==========================================================================
+  # CONTAINER IMAGES
+  # Everything else runs as containers - no binary downloads needed
+  # ==========================================================================
+  images:
+    # -------------------------------------------------------------------------
+    # Kubernetes Control Plane
+    # -------------------------------------------------------------------------
+    - image: registry.k8s.io/kube-apiserver:v1.32.3
+      description: "Kubernetes API server"
+      required: true
+
+    - image: registry.k8s.io/kube-controller-manager:v1.32.3
+      description: "Kubernetes controller manager"
+      required: true
+
+    - image: registry.k8s.io/kube-scheduler:v1.32.3
+      description: "Kubernetes scheduler"
+      required: true
+
+    - image: registry.k8s.io/kube-proxy:v1.32.3
+      description: "Kubernetes network proxy"
+      required: true
+
+    - image: registry.k8s.io/etcd:3.5.18-0
+      description: "Distributed key-value store"
+      required: true
+
+    - image: registry.k8s.io/pause:3.10
+      description: "Pod infrastructure container"
+      required: true
+
+    - image: registry.k8s.io/coredns/coredns:v1.12.0
+      description: "Cluster DNS"
+      required: true
+
+    # -------------------------------------------------------------------------
+    # Networking (Calico)
+    # Olares uses Calico for network policies (k3s flannel is disabled)
+    # Calico DaemonSet installs CNI plugins from container images - fully container-native!
+    # -------------------------------------------------------------------------
+    - image: docker.io/calico/cni:v3.29.2
+      description: "Calico CNI plugin (install-cni init container copies to /opt/cni/bin)"
+      required: true
+
+    - image: docker.io/calico/node:v3.29.2
+      description: "Calico node agent"
+      required: true
+
+    - image: docker.io/calico/kube-controllers:v3.29.2
+      description: "Calico Kubernetes controllers"
+      required: true
+
+    # -------------------------------------------------------------------------
+    # CLI Tools (run as containers)
+    # NOTE: On the OS image, kubectl/crictl exec into the k3s container.
+    # These container images are used by the installer and CI workflows.
+    # -------------------------------------------------------------------------
+    - image: rancher/kubectl:v1.32.3
+      description: "Kubernetes CLI (for installer container)"
+      alias: kubectl
+
+    - image: alpine/helm:3.17.1
+      description: "Kubernetes package manager"
+      alias: helm
+
+    - image: quay.io/coreos/etcd:v3.5.18
+      description: "etcd CLI tools (etcdctl)"
+      alias: etcdctl
+
+    # -------------------------------------------------------------------------
+    # Storage & Backup
+    # -------------------------------------------------------------------------
+    - image: minio/minio:RELEASE.2023-05-04T21-44-30Z
+      description: "Object storage server"
+
+    - image: velero/velero:v1.11.3
+      description: "Kubernetes backup tool"
+      alias: velero
+
+    - image: restic/restic:0.17.3
+      description: "Backup program"
+      alias: restic
+
+    - image: juicedata/juicefs-csi-driver:v0.24.0
+      description: "JuiceFS CSI driver"
+
+    # -------------------------------------------------------------------------
+    # Databases
+    # -------------------------------------------------------------------------
+    - image: redis:5.0.14-alpine
+      description: "In-memory data store"
+
+    - image: postgres:15-alpine
+      description: "PostgreSQL database"
+
+    - image: mongo:6.0
+      description: "MongoDB database"
+
+    # -------------------------------------------------------------------------
+    # Utilities
+    # -------------------------------------------------------------------------
+    - image: alpine/socat:1.7.4.4
+      description: "Multipurpose relay"
+      alias: socat
+
+    - image: curlimages/curl:8.5.0
+      description: "HTTP client"
+      alias: curl
+
+    # -------------------------------------------------------------------------
+    # Olares System Components
+    # -------------------------------------------------------------------------
+    - image: owncloudci/wait-for:latest
+      description: "Wait for services"
+
+    - image: liangjw/kube-webhook-certgen:v1.1.1
+      description: "Webhook certificate generator"
+
+    - image: beclab/alpine:3.14
+      description: "Olares base image"
+
+    - image: beclab/kube-rbac-proxy:0.19.0
+      description: "RBAC proxy"
+
+    # -------------------------------------------------------------------------
+    # Additional Olares images
+    # TODO: Import remaining images from .olares/Olares.yaml containers sections
+    # -------------------------------------------------------------------------
+
+  # ==========================================================================
+  # KERNEL/SYSTEM REQUIREMENTS
+  # These cannot be containerized - they're kernel modules or system packages
+  # ==========================================================================
+  system:
+    - id: nvidia-driver
+      version: "590.44.01"
+      description: "NVIDIA GPU driver (kernel module)"
+      optional: true
+      condition: "gpu.vendor == 'nvidia'"
+      artifacts:
+        linux/amd64:
+          url: https://us.download.nvidia.com/XFree86/Linux-x86_64/590.44.01/NVIDIA-Linux-x86_64-590.44.01.run
+        linux/arm64:
+          url: https://us.download.nvidia.com/XFree86/aarch64/590.44.01/NVIDIA-Linux-aarch64-590.44.01.run
+
+    - id: nvidia-container-toolkit
+      description: "NVIDIA container runtime hook"
+      optional: true
+      condition: "gpu.vendor == 'nvidia'"
+      # Installed via package manager, not direct download
+

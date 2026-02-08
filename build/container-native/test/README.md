@@ -1,0 +1,250 @@
+# Olares Test VM Infrastructure
+
+This directory contains tools for testing Olares in VMs with automatic updates from PR images.
+
+## Overview
+
+Two approaches for testing:
+
+1. **Test VM Container** (`Containerfile.test-vm`): Runs QEMU in a container
+2. **Self-Updating OS** (`Containerfile.test-os`): OS image that auto-updates on boot
+
+## Approach 1: Test VM Container
+
+Run an Olares VM inside a container with KVM acceleration.
+
+### Build
+
+```bash
+podman build -t olares-test-vm -f Containerfile.test-vm .
+```
+
+### Run
+
+```bash
+# Create persistent storage directory
+mkdir -p ~/olares-test-data
+
+# Run the test VM
+podman run --rm -it --privileged \
+    --device /dev/kvm \
+    -v ~/olares-test-data:/vm \
+    -e OLARES_REGISTRY=ghcr.io/myuser \
+    -e OLARES_TAG=pr-123 \
+    -p 2222:2222 \
+    -p 5900:5900 \
+    -p 6443:6443 \
+    olares-test-vm
+```
+
+### First Run
+
+On first run (no disk image in `/vm/`):
+1. Pulls the netinstall image from the registry
+2. Runs `bootc-image-builder` to build a QCOW2 (5-10 minutes)
+3. Caches the QCOW2 in `/vm/disk.qcow2`
+4. Boots the VM with UEFI
+5. Netinstall's first-boot service rebases to full Olares OS and reboots
+
+### Subsequent Runs
+
+On each boot:
+1. Boots existing QCOW2 directly (no rebuild)
+2. `bootc upgrade` checks for image updates
+3. If update available, stages and reboots
+4. Continues into Olares
+
+### Default Credentials
+
+- **Root password**: `olares` (for debugging via VNC/console)
+
+### Connect
+
+```bash
+# SSH (after Olares is up)
+ssh -p 2222 root@localhost
+
+# VNC (for console access)
+vncviewer localhost:5900
+
+# Kubernetes API
+export KUBECONFIG=~/.kube/olares-test
+kubectl --server=https://localhost:6443 get nodes
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLARES_REGISTRY` | `ghcr.io/olares` | Container registry |
+| `OLARES_TAG` | `latest` | Image tag (e.g., `pr-123`) |
+| `OLARES_IMAGE` | `os` | Image name |
+| `VM_MEMORY` | `4096` | VM memory in MB |
+| `VM_CPUS` | `2` | VM CPU count |
+| `VM_DISK_SIZE` | `50G` | Disk size |
+| `VM_SSH_PORT` | `2222` | SSH port mapping |
+| `VM_VNC_PORT` | `5900` | VNC port |
+
+## Approach 2: Self-Updating OS Image
+
+Build a test OS image that auto-updates on every boot.
+
+### Build
+
+```bash
+# Build test OS from PR image
+podman build \
+    --build-arg BASE_IMAGE=ghcr.io/myuser/olares-os:pr-123 \
+    -t olares-test-os:pr-123 \
+    -f Containerfile.test-os .
+```
+
+### Create VM
+
+```bash
+# Build QCOW2 from test OS
+sudo podman run --rm --privileged \
+    -v ./output:/output \
+    quay.io/centos-bootc/bootc-image-builder:latest \
+    --type qcow2 \
+    olares-test-os:pr-123
+
+# Or use the build script
+cd ../
+sudo ./build.sh qcow2 olares-test-os:pr-123
+```
+
+### Boot Flow
+
+```
+┌─────────────────┐
+│    VM Boots     │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ olares-auto-    │
+│ update.service  │
+│ runs            │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐    Yes    ┌─────────────────┐
+│ Update          │ ────────> │ bootc upgrade   │
+│ available?      │           │ + reboot        │
+└────────┬────────┘           └─────────────────┘
+         │ No
+         ▼
+┌─────────────────┐
+│ Continue boot   │
+│ into Olares     │
+└─────────────────┘
+```
+
+### Check Status
+
+Inside the VM:
+
+```bash
+# Show test status
+olares-test-status
+
+# View update log
+journalctl -u olares-auto-update
+
+# Manual update check
+bootc upgrade --check
+```
+
+## PR Testing Workflow
+
+### 1. PR Builds Images
+
+When you open a PR, the `pr-build-images.yaml` workflow builds:
+- `ghcr.io/<your-fork>/olares-os:pr-<number>`
+- `ghcr.io/<your-fork>/olares-netinstall:pr-<number>`
+- Other component images
+
+### 1b. CI Smoke Tests (optional)
+
+Add the `smoke-test` label to your PR to automatically:
+1. Build a QCOW2 from the OS image
+2. Boot it in a QEMU VM on the GitHub Actions runner (KVM-accelerated)
+3. Wait for k3s to become Ready
+4. Run smoke tests (systemd services, kubectl, pod creation)
+5. Upload logs as artifacts
+
+The smoke test script is at `test/smoke-test.sh` and can also be run locally.
+
+### 2. Start Test VM
+
+```bash
+# Use the test VM container
+podman run --rm -it --privileged \
+    --device /dev/kvm \
+    -v ~/pr-123-test:/vm \
+    -e OLARES_REGISTRY=ghcr.io/your-fork \
+    -e OLARES_TAG=pr-123 \
+    olares-test-vm
+```
+
+### 3. Push New Commits
+
+When you push new commits:
+1. PR workflow rebuilds images with same tag
+2. Next VM boot auto-updates to new images
+3. No need to recreate disk or restart container
+
+### 4. Test and Iterate
+
+- Make changes
+- Push
+- Wait for images to build
+- Reboot VM (or it will update on next scheduled check)
+- Test
+
+## Tips
+
+### Faster Iteration
+
+For faster iteration during development:
+
+```bash
+# SSH into running VM
+ssh -p 2222 root@localhost
+
+# Manually trigger update
+bootc upgrade
+
+# Reboot to apply
+systemctl reboot
+```
+
+### Persistent Data
+
+Data in `/vm` is persistent between container restarts:
+- `disk.qcow2` - VM disk image (built from netinstall on first run)
+
+### Debugging
+
+```bash
+# Inside VM: check bootc status
+bootc status
+
+# Inside VM: check update log
+cat /var/log/olares-auto-update.log
+
+# Inside VM: check k3s status
+systemctl status k3s
+kubectl get nodes
+kubectl get pods -A
+```
+
+### Clean Start
+
+```bash
+# Remove disk to start fresh
+rm -rf ~/olares-test-data/disk.qcow2
+
+# Next run will create new disk from netinstall
+```
