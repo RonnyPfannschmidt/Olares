@@ -1,49 +1,45 @@
 # Containerfile.test-vm
 #
 # Container that runs an Olares VM for testing.
-# The VM automatically updates itself from the configured registry on every boot.
+#
+# On first run (no disk), it builds a QCOW2 directly from the Olares
+# netinstall image using bootc-image-builder. The netinstall image is
+# already bootc-managed, so the QCOW2 boots straight into a bootc
+# deployment that rebases to the full Olares OS on first boot.
 #
 # Requirements:
 #   - KVM support on host (/dev/kvm must exist)
-#   - Disk image mounted at /vm/disk.qcow2 (or will be created)
+#   - Persistent volume at /vm for disk image caching
 #
 # Usage:
 #   # Build test container
 #   podman build -t olares-test-vm -f Containerfile.test-vm .
 #
-#   # Run with existing disk
+#   # Run (first run builds QCOW2, subsequent runs boot existing disk)
 #   podman run --rm -it --privileged \
 #     --device /dev/kvm \
 #     -v ./vm-data:/vm \
 #     -e OLARES_REGISTRY=ghcr.io/myuser \
 #     -e OLARES_TAG=pr-123 \
 #     olares-test-vm
-#
-#   # The VM will boot, update to PR images, reboot into Olares
-#
-#   NOTE: With Quadlet-based k3s, the guest's k3s uses its own embedded
-#   containerd. Sharing host podman storage does NOT make images visible
-#   to k3s. Images will be pulled by k3s on demand.
 
 FROM fedora:41
 
 LABEL org.opencontainers.image.title="Olares Test VM Runner"
 LABEL org.opencontainers.image.description="Runs Olares in a VM with auto-update on boot"
 
-# Install QEMU and networking tools (keep minimal to reduce image size)
-# NOTE: podman/skopeo are NOT needed here - this container only runs QEMU.
-# The guest OS handles its own container runtime.
+# Install QEMU, podman (for bootc-image-builder), and networking tools
 RUN dnf install -y --setopt=install_weak_deps=False \
     qemu-system-x86-core \
     qemu-img \
+    edk2-ovmf \
+    podman \
     curl \
     jq \
     # For TAP networking
     iproute \
     iptables-nft \
     dnsmasq \
-    # For cloud-init ISO
-    genisoimage \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 
@@ -69,8 +65,6 @@ ENV VM_DISK=/vm/disk.qcow2
 # Network mode: "user" (port forwarding) or "tap" (bridged, VM gets own IP)
 ENV VM_NETWORK_MODE=tap
 
-# Cloud image URL for initial disk (cached in /vm/cloud-base.qcow2)
-ENV VM_CLOUD_IMAGE_URL=https://download.fedoraproject.org/pub/fedora/linux/releases/41/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-41-1.4.x86_64.qcow2
 # For TAP mode: VM network configuration
 ENV VM_BRIDGE_IP=192.168.100.1
 ENV VM_BRIDGE_SUBNET=192.168.100.0/24
@@ -107,6 +101,8 @@ OLARES_REGISTRY="${OLARES_REGISTRY:-ghcr.io/olares}"
 OLARES_TAG="${OLARES_TAG:-latest}"
 OLARES_IMAGE="${OLARES_IMAGE:-os}"
 
+# Use the netinstall image - it's a bootc image that rebases to full OS on first boot
+NETINSTALL_IMAGE="${OLARES_REGISTRY}/olares-netinstall:${OLARES_TAG}"
 FULL_IMAGE="${OLARES_REGISTRY}/olares-${OLARES_IMAGE}:${OLARES_TAG}"
 
 # Will be set by setup_network
@@ -189,7 +185,8 @@ EOF
 
 # Create or verify disk image
 setup_disk() {
-    local disk_dir=$(dirname "$VM_DISK")
+    local disk_dir
+    disk_dir=$(dirname "$VM_DISK")
     
     if [[ ! -d "$disk_dir" ]]; then
         log "ERROR: Disk directory not mounted: $disk_dir"
@@ -198,169 +195,74 @@ setup_disk() {
     fi
     
     if [[ ! -f "$VM_DISK" ]]; then
-        log "Creating new disk image: $VM_DISK ($VM_DISK_SIZE)"
-        log "This will be a fresh Olares installation."
-        
-        # Need to build initial image from netinstall
-        create_initial_disk
+        log "No existing disk found. Building QCOW2 from netinstall image..."
+        log "This is a one-time operation (cached in /vm for future runs)."
+        log ""
+        build_disk_from_netinstall
     else
         log "Using existing disk: $VM_DISK"
-        log "VM will update to ${FULL_IMAGE} on boot."
     fi
 }
 
-# Create initial disk from a cloud image
-# This uses a Fedora cloud image and cloud-init to run bootc install to-existing-root
-create_initial_disk() {
-    local cloud_image_url="${VM_CLOUD_IMAGE_URL:-https://download.fedoraproject.org/pub/fedora/linux/releases/41/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-41-1.4.x86_64.qcow2}"
-    local cloud_image="/vm/cloud-base.qcow2"
-    
-    log "Creating initial disk from cloud image..."
-    
-    # Download cloud image if not cached
-    if [[ ! -f "$cloud_image" ]]; then
-        log "Downloading cloud image..."
-        log "URL: ${cloud_image_url}"
-        curl -fSL -o "$cloud_image" "$cloud_image_url" || {
-            log "ERROR: Failed to download cloud image"
-            exit 1
-        }
-        log "Cloud image downloaded: $(du -h "$cloud_image" | cut -f1)"
-    else
-        log "Using cached cloud image: $cloud_image"
-    fi
-    
-    # Create disk from cloud image
-    log "Creating VM disk from cloud image..."
-    cp "$cloud_image" "$VM_DISK"
-    
-    # Resize disk to target size
-    log "Resizing disk to ${VM_DISK_SIZE}..."
-    qemu-img resize "$VM_DISK" "$VM_DISK_SIZE"
-    
-    log "Initial disk created: $VM_DISK"
+# Build a QCOW2 directly from the netinstall image using bootc-image-builder
+# The netinstall is already a bootc image (based on centos-bootc:stream9),
+# so the resulting QCOW2 boots straight into a proper bootc deployment.
+build_disk_from_netinstall() {
+    log "Building QCOW2 from: ${NETINSTALL_IMAGE}"
+    log "This may take 5-10 minutes on first run..."
     log ""
-    log "On first boot, cloud-init will:"
-    log "  1. Install bootc"
-    log "  2. Switch to ${FULL_IMAGE}"
-    log "  3. Reboot into Olares"
-}
 
-# Write cloud-init config for bootstrapping and auto-update
-setup_cloud_init() {
-    local ci_dir="/vm/cidata"
-    mkdir -p "$ci_dir"
-    
-    # Marker file to track if we've done initial switch
-    local switch_marker="/var/lib/olares-switched"
-    
-    # Create user-data that handles both initial install and updates
-    #
-    # IMPORTANT: On a regular Fedora Cloud image (non-bootc), "bootc switch"
-    # does NOT work because the system is not ostree-managed. Instead we use
-    # "bootc install to-existing-root" which must be run FROM a container
-    # image (via podman). This converts the system to a bootc deployment.
-    #
-    # On subsequent boots (already bootc-managed), "bootc upgrade" works.
-    cat > "${ci_dir}/user-data" << EOF
-#cloud-config
-# Olares Test VM Cloud-Init Configuration
-# Handles: initial bootc install OR subsequent updates
+    # Create bootc-image-builder config to set root password and SSH
+    cat > /tmp/config.toml << 'TOML'
+[[customizations.user]]
+name = "root"
+password = "olares"
+TOML
 
-# Set password for root (for debugging)
-chpasswd:
-  list: |
-    root:olares
-  expire: false
+    # Build QCOW2 using bootc-image-builder
+    # This runs as a privileged container that reads the netinstall image
+    # and produces a bootable QCOW2 disk.
+    local output_dir="/vm/bib-output"
+    mkdir -p "$output_dir"
 
-ssh_pwauth: true
-
-# Enable root SSH login
-runcmd:
-  - sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-  - systemctl restart sshd
-  - |
-    set -x
-    SWITCH_MARKER="${switch_marker}"
-    TARGET_IMAGE="${FULL_IMAGE}"
-    LOG="/var/log/olares-bootstrap.log"
-    
-    echo "=== Olares Test VM Bootstrap ===" | tee -a "\$LOG"
-    date | tee -a "\$LOG"
-    echo "Target: \$TARGET_IMAGE" | tee -a "\$LOG"
-    
-    if [[ -f "\$SWITCH_MARKER" ]]; then
-      # Already installed - check for updates via bootc upgrade
-      echo "System already installed, checking for updates..." | tee -a "\$LOG"
-      if bootc upgrade 2>&1 | tee -a "\$LOG"; then
-        if bootc status | grep -q "staged"; then
-          echo "Update staged, rebooting..." | tee -a "\$LOG"
-          touch /run/reboot-required
-        else
-          echo "Already up to date" | tee -a "\$LOG"
+    if podman run --rm --privileged \
+        --security-opt label=type:unconfined_t \
+        -v "${output_dir}:/output" \
+        -v /tmp/config.toml:/config.toml:ro \
+        -v /var/lib/containers/storage:/var/lib/containers/storage \
+        quay.io/centos-bootc/bootc-image-builder:latest \
+        --type qcow2 \
+        --config /config.toml \
+        --output /output \
+        "${NETINSTALL_IMAGE}"; then
+        
+        # Move QCOW2 to expected location
+        local built_qcow2
+        built_qcow2=$(find "$output_dir" -name "*.qcow2" | head -1)
+        
+        if [[ -z "$built_qcow2" ]]; then
+            log "ERROR: bootc-image-builder succeeded but no QCOW2 found"
+            ls -la "$output_dir"
+            exit 1
         fi
-      fi
+        
+        mv "$built_qcow2" "$VM_DISK"
+        rm -rf "$output_dir"
+        
+        # Resize to target size
+        log "Resizing disk to ${VM_DISK_SIZE}..."
+        qemu-img resize "$VM_DISK" "$VM_DISK_SIZE"
+        
+        log "QCOW2 built successfully: $VM_DISK"
+        log ""
+        log "On first boot, the netinstall service will:"
+        log "  1. Rebase to full Olares OS (${FULL_IMAGE})"
+        log "  2. Reboot into Olares"
     else
-      # First boot on a non-bootc system (e.g., Fedora Cloud)
-      # Use "bootc install to-existing-root" which must run FROM the target
-      # container image. This converts the running system to bootc-managed.
-      echo "First boot: installing bootc from \$TARGET_IMAGE..." | tee -a "\$LOG"
-      
-      # Ensure podman is available (Fedora Cloud has it or can install it)
-      if ! command -v podman &>/dev/null; then
-        echo "Installing podman..." | tee -a "\$LOG"
-        dnf install -y podman 2>&1 | tee -a "\$LOG"
-      fi
-      
-      echo "Running bootc install to-existing-root..." | tee -a "\$LOG"
-      if podman run --rm --privileged \
-          --pid=host \
-          -v /dev:/dev \
-          -v /:/target \
-          -v /var/lib/containers:/var/lib/containers \
-          --security-opt label=type:unconfined_t \
-          "\$TARGET_IMAGE" \
-          bootc install to-existing-root \
-            --target-no-signature-verification 2>&1 | tee -a "\$LOG"; then
-        touch "\$SWITCH_MARKER"
-        echo "Install successful, rebooting..." | tee -a "\$LOG"
-        touch /run/reboot-required
-      else
-        echo "ERROR: bootc install to-existing-root failed" | tee -a "\$LOG"
-        echo "Check \$LOG for details" | tee -a "\$LOG"
-      fi
+        log "ERROR: bootc-image-builder failed"
+        log "Check that the image exists: ${NETINSTALL_IMAGE}"
+        exit 1
     fi
-
-# Reboot if needed
-power_state:
-  delay: "+1"
-  mode: reboot
-  condition: test -f /run/reboot-required
-EOF
-
-    # Create meta-data
-    cat > "${ci_dir}/meta-data" << EOF
-instance-id: ${VM_HOSTNAME}
-local-hostname: ${VM_HOSTNAME}
-EOF
-
-    # Create cloud-init ISO
-    log "Creating cloud-init ISO..."
-    if command -v genisoimage &>/dev/null; then
-        genisoimage -output /vm/cidata.iso -volid cidata -joliet -rock \
-            "${ci_dir}/user-data" "${ci_dir}/meta-data" 2>/dev/null
-    elif command -v mkisofs &>/dev/null; then
-        mkisofs -output /vm/cidata.iso -volid cidata -joliet -rock \
-            "${ci_dir}/user-data" "${ci_dir}/meta-data" 2>/dev/null
-    else
-        log "WARN: No ISO creation tool found, cloud-init disabled"
-        return
-    fi
-    
-    log "Cloud-init configured:"
-    log "  - Root password: olares"
-    log "  - First boot: bootc install to-existing-root from ${FULL_IMAGE}"
-    log "  - Subsequent boots: bootc upgrade"
 }
 
 # Start QEMU
@@ -370,8 +272,39 @@ start_qemu() {
     log "  CPUs: ${VM_CPUS}"
     log "  Disk: ${VM_DISK}"
     log ""
-    log "Target image: ${FULL_IMAGE}"
+    log "Netinstall image: ${NETINSTALL_IMAGE}"
+    log "Full OS image:    ${FULL_IMAGE}"
     log ""
+
+    # Detect OVMF paths (bootc images require UEFI)
+    local ovmf_code=""
+    local ovmf_vars=""
+    for code_path in \
+        /usr/share/edk2/ovmf/OVMF_CODE.fd \
+        /usr/share/OVMF/OVMF_CODE_4M.fd \
+        /usr/share/OVMF/OVMF_CODE.fd; do
+        if [[ -f "$code_path" ]]; then
+            ovmf_code="$code_path"
+            break
+        fi
+    done
+    for vars_path in \
+        /usr/share/edk2/ovmf/OVMF_VARS.fd \
+        /usr/share/OVMF/OVMF_VARS_4M.fd \
+        /usr/share/OVMF/OVMF_VARS.fd; do
+        if [[ -f "$vars_path" ]]; then
+            ovmf_vars="$vars_path"
+            break
+        fi
+    done
+
+    if [[ -z "$ovmf_code" ]]; then
+        log "ERROR: OVMF/UEFI firmware not found. bootc images require UEFI boot."
+        exit 1
+    fi
+
+    # OVMF_VARS must be writable (VM writes EFI variables)
+    cp "$ovmf_vars" /tmp/efivars.fd
 
     local qemu_args=(
         -name "olares-test"
@@ -379,6 +312,10 @@ start_qemu() {
         -cpu host
         -m "${VM_MEMORY}"
         -smp "${VM_CPUS}"
+        # UEFI firmware (required for bootc images)
+        -drive "if=pflash,format=raw,readonly=on,file=${ovmf_code}"
+        -drive "if=pflash,format=raw,file=/tmp/efivars.fd"
+        # Disk
         -drive "file=${VM_DISK},format=qcow2,if=virtio"
         -vnc ":$(( VM_VNC_PORT - 5900 ))"
         -serial stdio
@@ -404,18 +341,6 @@ start_qemu() {
     log "Connect via VNC: vncviewer localhost:${VM_VNC_PORT}"
     log ""
     
-    # Add cloud-init if available
-    if [[ -f /vm/cidata.iso ]]; then
-        qemu_args+=(-cdrom /vm/cidata.iso)
-    fi
-    
-    # Enable UEFI boot
-    if [[ -f /usr/share/edk2/ovmf/OVMF_CODE.fd ]]; then
-        qemu_args+=(
-            -drive "if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd"
-        )
-    fi
-    
     exec qemu-system-x86_64 "${qemu_args[@]}"
 }
 
@@ -428,7 +353,6 @@ main() {
     check_kvm
     setup_network
     setup_disk
-    setup_cloud_init
     start_qemu
 }
 
